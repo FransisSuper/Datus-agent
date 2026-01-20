@@ -1,0 +1,28 @@
+agent:
+  target: openai
+  models:
+    openai:
+      type: openai
+      vendor: openai
+      base_url: https://api.openai-hk.com/v1
+      api_key: hk-sfl0rj1000055004c814a7ad2027cb6ca177b59fa736ca31
+      model: gpt-4o
+
+  # local databases configuration
+  namespace:
+    duckdb-demo:
+      type: duckdb
+      name: duckdb-demo
+      uri: /Users/fangchao/.datus/sample/duckdb-demo.duckdb
+    sqlite_demo:
+      type: sqlite
+      name: sqlite_demo
+      uri: /Users/fangchao/.datus/benchmark/california_schools/california_schools.sqlite
+
+  workflow:
+    plan: fixed
+
+  storage:
+    # Data path is now fixed at {agent.home}/data
+    # Final storage paths: {home}/data/datus_db_{namespace}, {home}/data/sub_agents/{agent_name}, etc.
+    embedding_device_type: cpu # If set to cpu, it will be specified as cpu, otherwise, it will be automatically selected based on the current machine
