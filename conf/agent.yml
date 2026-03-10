@@ -1,4 +1,13 @@
 agent:
+  #target: gemini
+  #models:
+  #  gemini:
+  #    type: gemini
+  #    vendor: google
+  #    base_url: https://generativelanguage.googleapis.com/v1beta
+  #    api_key: AIzaSyCUcSgbTU5q8thkKt54qXNhovRl1dIyt7I
+  #    model: gemini-2.0-flash
+
   target: openai
   models:
     openai:
@@ -18,6 +27,15 @@ agent:
       type: sqlite
       name: sqlite_demo
       uri: /Users/fangchao/.datus/benchmark/california_schools/california_schools.sqlite
+    gemini-demo:
+      type: duckdb
+      name: gemini-demo
+      uri: /Users/fangchao/.datus/sample/duckdb-demo.duckdb
+    emotion_analytics: # 必须与命令中的 --namespace 一致
+      type: duckdb              # 或 sqlite/mysql/postgresql 等
+      dbs:
+        - name: emotion_db
+          uri: duckdb:/Users/fangchao/.datus/sample/duckdb-demo.duckdb  # 你的数据库路径
 
   workflow:
     plan: fixed
