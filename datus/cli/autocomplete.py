@@ -20,6 +20,7 @@ from pygments.token import Token
 
 from datus.configuration.agent_config import AgentConfig
 from datus.schemas.node_models import Metric, ReferenceSql, TableSchema
+from datus.tools.db_tools.registry import connector_registry
 from datus.utils.constants import SYS_SUB_AGENTS, DBType
 from datus.utils.loggings import get_logger
 from datus.utils.path_utils import get_file_fuzzy_matches
@@ -618,9 +619,9 @@ class TableCompleter(DynamicAtReferenceCompleter):
 
         data: Dict[str, Any] = {}
 
-        if DBType.support_catalog(self.agent_config.db_type) and catalog_column[0].as_py():
-            if DBType.support_database(self.agent_config.db_type):
-                if DBType.support_schema(self.agent_config.db_type):
+        if connector_registry.support_catalog(self.agent_config.db_type) and catalog_column[0].as_py():
+            if connector_registry.support_database(self.agent_config.db_type):
+                if connector_registry.support_schema(self.agent_config.db_type):
                     # catalog -> database -> schema -> table
                     self.max_level = 4
                     # Catalog -> Database -> Schema -> Table structure
@@ -665,7 +666,7 @@ class TableCompleter(DynamicAtReferenceCompleter):
                             "definition": definition.as_py(),
                         }
                     return data
-            elif DBType.support_schema(self.agent_config.db_type):
+            elif connector_registry.support_schema(self.agent_config.db_type):
                 self.max_level = 3
                 # catalog -> schema -> table
                 for catalog, schema, table, definition, table_type, identifier in zip(
@@ -686,8 +687,10 @@ class TableCompleter(DynamicAtReferenceCompleter):
                         "definition": definition.as_py(),
                     }
 
-        if (DBType.support_database(self.agent_config.db_type) or self.sqlite_show_db) and database_column[0].as_py():
-            if DBType.support_schema(self.agent_config.db_type) and schema_column[0].as_py():
+        if (connector_registry.support_database(self.agent_config.db_type) or self.sqlite_show_db) and database_column[
+            0
+        ].as_py():
+            if connector_registry.support_schema(self.agent_config.db_type) and schema_column[0].as_py():
                 self.max_level = 3
                 # Database -> Schema -> Table structure
                 for database, schema, table, definition, table_type, identifier in zip(
@@ -727,7 +730,7 @@ class TableCompleter(DynamicAtReferenceCompleter):
                     }
             return data
 
-        if DBType.support_schema(self.agent_config.db_type):
+        if connector_registry.support_schema(self.agent_config.db_type):
             self.max_level = 2
             # schema -> table
             for schema, table, definition, table_type, identifier in zip(
@@ -981,15 +984,22 @@ class SubagentCompleter(Completer):
     def __init__(self, agent_config: AgentConfig):
         """Initialize with agent configuration."""
         self.agent_config = agent_config
+        self._available_subagent = []
+        self.refresh()
+
+    def refresh(self):
         self._available_subagents = self._load_subagents()
 
     def _load_subagents(self) -> List[str]:
         """Load available subagents from configuration and include built-in subagents."""
         subagents = list(SYS_SUB_AGENTS)
         if hasattr(self.agent_config, "agentic_nodes") and self.agent_config.agentic_nodes:
-            for name in self.agent_config.agentic_nodes.keys():
+            for name, sub_config in self.agent_config.agentic_nodes.items():
                 if name != "chat" and name not in SYS_SUB_AGENTS:  # Exclude default chat and avoid duplicates
-                    subagents.append(name)
+                    sub_namespace = sub_config.get("scoped_context", {}).get("namespace")
+                    # Can only access sub-agent under the current namespace
+                    if not sub_namespace or sub_namespace == self.agent_config.current_namespace:
+                        subagents.append(name)
         return subagents
 
     def get_completions(self, document: Document, complete_event=None) -> Iterable[Completion]:

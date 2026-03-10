@@ -8,7 +8,7 @@ from typing import Dict, List
 from agents import Tool
 
 from datus.configuration.agent_config import AgentConfig
-from datus.storage.lancedb_conditions import And, build_where, eq
+from datus.storage.conditions import And, build_where, eq
 from datus.storage.metric.store import MetricRAG
 from datus.storage.semantic_model.store import SemanticModelRAG
 from datus.tools.func_tool.base import FuncToolResult, trans_to_function_tool
@@ -40,12 +40,10 @@ class GenerationTools:
         return [
             trans_to_function_tool(func)
             for func in (
-                self.check_semantic_object_exists,  # Updated name to reflect broader scope
-                self.check_metric_exists,  # Kept for backward compat or specific metric checks
+                self.check_semantic_object_exists,
                 self.generate_sql_summary_id,
                 self.end_semantic_model_generation,
                 self.end_metric_generation,
-                self.generate_ext_knowledge_id,
             )
         ]
 
@@ -56,7 +54,7 @@ class GenerationTools:
         table_context: str = "",
     ) -> FuncToolResult:
         """
-        Check if a semantic object (table, column, metric) already exists in LanceDB.
+        Check if a semantic object (table, column, metric) already exists in vector store.
 
         Use this tool to avoid duplicating work.
 
@@ -82,13 +80,12 @@ class GenerationTools:
                 if results:
                     found_object = results[0]
             elif kind == "metric":
-                # For metrics, search all and filter by name
+                # Exact match for metric using SQL WHERE condition
                 storage = self.metric_rag.storage
-                results = storage.search_all(select_fields=["id", "name"])
-                for obj in results:
-                    if obj.get("name", "").lower() == target_name:
-                        found_object = obj
-                        break
+                where = build_where(eq("name", target_name))
+                results = storage.search_all(where=where, select_fields=["id", "name"])
+                if results:
+                    found_object = results[0]
             else:
                 # For column, use vector search + post-filter
                 storage = self.semantic_rag.storage
@@ -144,18 +141,12 @@ class GenerationTools:
         """Legacy wrapper for checking table existence."""
         return self.check_semantic_object_exists(table_name, kind="table")
 
-    def check_metric_exists(self, metric_name: str) -> FuncToolResult:
-        """
-        Check if metric already exists.
-        """
-        return self.check_semantic_object_exists(metric_name, kind="metric")
-
     def end_semantic_model_generation(self, semantic_model_files: List[str]) -> FuncToolResult:
         """
         Complete semantic model generation process.
 
         Call this tool when you have finished generating semantic model YAML files.
-        This tool triggers user confirmation workflow for syncing to LanceDB.
+        This tool triggers user confirmation workflow for syncing to vector store.
 
         Args:
             semantic_model_files: List of absolute paths to generated semantic model YAML files
@@ -186,7 +177,7 @@ class GenerationTools:
         Complete metric generation process.
 
         Call this tool when you have finished generating a metric YAML file.
-        This tool triggers user confirmation workflow for syncing to LanceDB.
+        This tool triggers user confirmation workflow for syncing to vector store.
 
         Args:
             metric_file: Absolute path to the generated metric YAML file (required)
@@ -244,45 +235,4 @@ class GenerationTools:
 
         except Exception as e:
             logger.error(f"Error generating reference SQL ID: {e}")
-            return FuncToolResult(success=0, error=f"Failed to generate ID: {str(e)}")
-
-    def generate_ext_knowledge_id(self, search_text: str, subject_path: str = "") -> FuncToolResult:
-        """
-        Generate a unique ID for external knowledge entry based on search_text and subject path.
-
-        This tool helps create consistent, unique IDs for external knowledge entries.
-        Use this tool when you need to generate an ID for a new knowledge entry.
-
-        Args:
-            search_text: The business search_text/concept that will be used to generate the ID
-            subject_path: Optional subject path string (format: "domain/layer1/layer2")
-
-        Returns:
-            dict: A dictionary with the execution result, containing these keys:
-                  - 'success' (int): 1 for success, 0 for failure
-                  - 'error' (Optional[str]): Error message on failure
-                  - 'result' (str): The generated unique ID
-
-        Example:
-            result = generate_ext_knowledge_id(
-                search_text="GMV",
-                subject_path="Finance/Revenue/Metrics"
-            )
-        """
-        try:
-            from datus.storage.ext_knowledge.init_utils import gen_ext_knowledge_id
-
-            # Parse subject_path string into list
-            subject_path_list = []
-            if subject_path:
-                subject_path_list = [part.strip() for part in subject_path.split("/") if part.strip()]
-
-            # Generate the ID using the same utility as the storage system
-            generated_id = gen_ext_knowledge_id(subject_path_list, search_text)
-
-            logger.info(f"Generated external knowledge ID: {generated_id}")
-            return FuncToolResult(result=generated_id)
-
-        except Exception as e:
-            logger.error(f"Error generating external knowledge ID: {e}")
             return FuncToolResult(success=0, error=f"Failed to generate ID: {str(e)}")

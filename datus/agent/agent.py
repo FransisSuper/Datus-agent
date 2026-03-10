@@ -44,7 +44,9 @@ from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.json_utils import to_str
 from datus.utils.loggings import get_logger
 from datus.utils.path_manager import get_path_manager
+from datus.utils.path_utils import safe_rmtree
 from datus.utils.time_utils import format_duration_human
+from datus.utils.traceable_utils import optional_traceable
 
 logger = get_logger(__name__)
 
@@ -84,6 +86,11 @@ class Agent:
         self._metrics_row_stage_seen: Dict[str, Set[str]] = {}
         self._print_lock = threading.Lock()
         self._check_storage_modules()
+
+    @property
+    def _force_delete(self) -> bool:
+        """Check if force/yes flag is set to skip deletion confirmations."""
+        return getattr(self.args, "force", False) or getattr(self.args, "yes", False)
 
     def _initialize_model(self) -> LLMBaseModel:
         llm_model = LLMBaseModel.create_model(model_name="default", agent_config=self.global_config)
@@ -149,9 +156,10 @@ class Agent:
         sql_task: Optional[SqlTask] = None,
         check_storage: bool = False,
         action_history_manager: Optional[ActionHistoryManager] = None,
+        run_id: Optional[str] = None,
     ) -> AsyncGenerator[ActionHistory, None]:
         """Execute a workflow with streaming progress updates."""
-        runner = self.create_workflow_runner()
+        runner = self.create_workflow_runner(run_id=run_id)
         async for action in runner.run_stream(
             sql_task=sql_task,
             check_storage=check_storage,
@@ -269,7 +277,9 @@ class Agent:
         if not text:
             return
         for line in text.splitlines():
-            print(f"{prefix}{indent}{line}", flush=True)
+            # Only print non-empty lines to avoid blank output
+            if line.strip():
+                print(f"{prefix}{indent}{line}", flush=True)
 
     def _next_reference_sql_number(self, filepath: str) -> int:
         with self._print_lock:
@@ -353,6 +363,7 @@ class Agent:
             logger.info("Metrics item success")
             return
 
+    @optional_traceable(name="bootstrap_kb")
     def bootstrap_kb(self):
         """Initialize knowledge base storage components."""
         logger.info("Initializing knowledge base components")
@@ -393,17 +404,11 @@ class Agent:
 
                 if kb_update_strategy == "overwrite":
                     self.global_config.save_storage_config("database")
-                    schema_metadata_path = os.path.join(dir_path, "schema_metadata.lance")
-                    if os.path.exists(schema_metadata_path):
-                        shutil.rmtree(schema_metadata_path)
-                        logger.info(f"Deleted existing directory {schema_metadata_path}")
-                    schema_value_path = os.path.join(dir_path, "schema_value.lance")
-                    if os.path.exists(schema_value_path):
-                        shutil.rmtree(schema_value_path)
-                        logger.info(f"Deleted existing directory {schema_value_path}")
                 else:
                     self.global_config.check_init_storage_config("database")
                 self.metadata_store = SchemaWithValueRAG(self.global_config)
+                if kb_update_strategy == "overwrite":
+                    self.metadata_store.truncate()
 
                 if not benchmark_platform:
                     self.check_db()
@@ -458,20 +463,26 @@ class Agent:
                 return result
 
             elif component == "semantic_model":
-                semantic_model_path = os.path.join(dir_path, "semantic_model.lance")
                 if kb_update_strategy == "overwrite":
-                    if os.path.exists(semantic_model_path):
-                        shutil.rmtree(semantic_model_path)
-                        logger.info(f"Deleted existing directory {semantic_model_path}")
-                    # Also clear semantic_models/{namespace} directory (YAML files)
-                    path_manager = get_path_manager(datus_home=self.global_config.home)
-                    semantic_yaml_dir = path_manager.semantic_model_path(self.global_config.current_namespace)
-                    if semantic_yaml_dir.exists():
-                        shutil.rmtree(semantic_yaml_dir)
-                        logger.info(f"Deleted existing semantic YAML directory {semantic_yaml_dir}")
+                    # Only clear semantic_models/{namespace} directory when NOT using --from_adapter
+                    # because MetricFlow adapter needs to read YAML files from this directory
+                    if not (hasattr(self.args, "from_adapter") and self.args.from_adapter):
+                        path_manager = get_path_manager(datus_home=self.global_config.home)
+                        semantic_yaml_dir = path_manager.semantic_model_path(self.global_config.current_namespace)
+                        force = self._force_delete
+                        if semantic_yaml_dir.exists() and not safe_rmtree(
+                            semantic_yaml_dir, "semantic YAML directory", force=force
+                        ):
+                            return {
+                                "status": "cancelled",
+                                "message": "User cancelled deletion of semantic YAML directory",
+                            }
                     self.global_config.save_storage_config("semantic_model")
                 else:
                     self.global_config.check_init_storage_config("semantic_model")
+                temp_rag = SemanticModelRAG(self.global_config)
+                if kb_update_strategy == "overwrite":
+                    temp_rag.truncate()
 
                 # Initialize semantic model
                 if hasattr(self.args, "from_adapter") and self.args.from_adapter:
@@ -489,7 +500,6 @@ class Agent:
                     successful, error_message = init_success_story_semantic_model(self.args, self.global_config)
 
                 if successful:
-                    temp_rag = SemanticModelRAG(self.global_config)
                     result = {
                         "status": "success",
                         "message": f"semantic_model bootstrap completed, "
@@ -502,20 +512,26 @@ class Agent:
                 return result
 
             elif component == "metrics":
-                metrics_path = os.path.join(dir_path, "metrics.lance")
                 if kb_update_strategy == "overwrite":
-                    if os.path.exists(metrics_path):
-                        shutil.rmtree(metrics_path)
-                        logger.info(f"Deleted existing directory {metrics_path}")
-                    # Also clear semantic_models/{namespace} directory (YAML files)
-                    path_manager = get_path_manager(datus_home=self.global_config.home)
-                    semantic_yaml_dir = path_manager.semantic_model_path(self.global_config.current_namespace)
-                    if semantic_yaml_dir.exists():
-                        shutil.rmtree(semantic_yaml_dir)
-                        logger.info(f"Deleted existing semantic YAML directory {semantic_yaml_dir}")
+                    # Only clear semantic_models/{namespace} directory when NOT using --from_adapter
+                    # because MetricFlow adapter needs to read YAML files from this directory
+                    if not (hasattr(self.args, "from_adapter") and self.args.from_adapter):
+                        path_manager = get_path_manager(datus_home=self.global_config.home)
+                        semantic_yaml_dir = path_manager.semantic_model_path(self.global_config.current_namespace)
+                        force = self._force_delete
+                        if semantic_yaml_dir.exists() and not safe_rmtree(
+                            semantic_yaml_dir, "semantic YAML directory", force=force
+                        ):
+                            return {
+                                "status": "cancelled",
+                                "message": "User cancelled deletion of semantic YAML directory",
+                            }
                     self.global_config.save_storage_config("metric")  # Keep compatibility
                 else:
                     self.global_config.check_init_storage_config("metric")
+                self.metrics_store = MetricRAG(self.global_config)
+                if kb_update_strategy == "overwrite":
+                    self.metrics_store.truncate()
                 self._reset_metrics_stream_state()
 
                 # Initialize metrics
@@ -548,27 +564,25 @@ class Agent:
                 else:
                     result = {"status": "failed", "message": error_message}
                 return result
-            elif component == "document":
-                from datus.storage.document.store import document_store
-
-                self.storage_modules["document_store"] = document_store(self.global_config.rag_storage_path())
-                # self.global_config.check_init_storage_config("document")
             elif component == "ext_knowledge":
-                ext_knowledge_path = os.path.join(dir_path, "ext_knowledge.lance")
                 if kb_update_strategy == "overwrite":
-                    if os.path.exists(ext_knowledge_path):
-                        shutil.rmtree(ext_knowledge_path)
-                        logger.info(f"Deleted existing directory {ext_knowledge_path}")
                     # Also clear ext_knowledge/{namespace} directory
                     path_manager = get_path_manager(datus_home=self.global_config.home)
                     ext_knowledge_dir = path_manager.ext_knowledge_path(self.global_config.current_namespace)
-                    if ext_knowledge_dir.exists():
-                        shutil.rmtree(ext_knowledge_dir)
-                        logger.info(f"Deleted existing ext_knowledge directory {ext_knowledge_dir}")
+                    force = self._force_delete
+                    if ext_knowledge_dir.exists() and not safe_rmtree(
+                        ext_knowledge_dir, "external knowledge directory", force=force
+                    ):
+                        return {
+                            "status": "cancelled",
+                            "message": "User cancelled deletion of external knowledge directory",
+                        }
                     self.global_config.save_storage_config("ext_knowledge")
                 else:
                     self.global_config.check_init_storage_config("ext_knowledge")
                 self.ext_knowledge_rag = ExtKnowledgeRAG(self.global_config)
+                if kb_update_strategy == "overwrite":
+                    self.ext_knowledge_rag.truncate()
                 # Initialize ext_knowledge using appropriate method
                 if hasattr(self.args, "ext_knowledge") and self.args.ext_knowledge:
                     # Use CSV file directly
@@ -585,23 +599,22 @@ class Agent:
                             "status": "failed",
                             "message": error_message,
                         }
+                self._refresh_scoped_agents("ext_knowledge", kb_update_strategy)
                 return {
                     "status": "success",
                     "message": f"ext_knowledge bootstrap completed, "
                     f"knowledge_size={self.ext_knowledge_rag.store.table_size()}",
                 }
             elif component == "reference_sql":
-                reference_sql_path = os.path.join(dir_path, "reference_sql.lance")
                 if kb_update_strategy == "overwrite":
-                    if os.path.exists(reference_sql_path):
-                        shutil.rmtree(reference_sql_path)
-                        logger.info(f"Deleted existing directory {reference_sql_path}")
                     # Also clear sql_summaries/{namespace} directory (YAML files)
                     path_manager = get_path_manager(datus_home=self.global_config.home)
                     sql_summary_dir = path_manager.sql_summary_path(self.global_config.current_namespace)
-                    if sql_summary_dir.exists():
-                        shutil.rmtree(sql_summary_dir)
-                        logger.info(f"Deleted existing SQL summary directory {sql_summary_dir}")
+                    force = self._force_delete
+                    if sql_summary_dir.exists() and not safe_rmtree(
+                        sql_summary_dir, "SQL summary directory", force=force
+                    ):
+                        return {"status": "cancelled", "message": "User cancelled deletion of SQL summary directory"}
                     self.global_config.save_storage_config("reference_sql")
                 else:
                     self.global_config.check_init_storage_config("reference_sql")
@@ -611,6 +624,8 @@ class Agent:
                 from datus.storage.reference_sql.reference_sql_init import init_reference_sql
 
                 self.reference_sql_store = ReferenceSqlRAG(self.global_config)
+                if kb_update_strategy == "overwrite":
+                    self.reference_sql_store.truncate()
                 self._reset_reference_sql_stream_state()
                 result = init_reference_sql(
                     self.reference_sql_store,
@@ -640,7 +655,7 @@ class Agent:
             "components": results,
         }
 
-    def benchmark(self):
+    def benchmark(self, run_id: Optional[str] = None):
         logger.info("Benchmarking begins")
         benchmark_platform = self.args.benchmark
         benchmark_path = self.global_config.benchmark_path(benchmark_platform)
@@ -650,27 +665,30 @@ class Agent:
 
         target_task_ids = getattr(self.args, "benchmark_task_ids", [])
         target_task_ids = set(target_task_ids) if target_task_ids else None
-        import time
-        from datetime import datetime
 
-        # Generate a shared run_id for this benchmark run
-        benchmark_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        logger.info(f"Benchmark run_id: {benchmark_run_id}")
+        if not run_id:
+            from datetime import datetime
+
+            # Generate a shared run_id for this benchmark run
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        logger.info(f"Benchmark run_id: {run_id}")
+        import time
 
         start = time.perf_counter()
         if benchmark_platform == "semantic_layer":
             self.global_config.check_init_storage_config("metric")
-            result = self.benchmark_semantic_layer(benchmark_path, target_task_ids, run_id=benchmark_run_id)
+            result = self.benchmark_semantic_layer(benchmark_path, target_task_ids, run_id=run_id)
         else:
             self.global_config.check_init_storage_config("database")
             self.global_config.check_init_storage_config("metric")
-            result = self.do_benchmark(benchmark_platform, target_task_ids, run_id=benchmark_run_id)
+            result = self.do_benchmark(benchmark_platform, target_task_ids, run_id=run_id)
         end = time.perf_counter()
 
         time_spends = end - start
         result["time_spends"] = format_duration_human(time_spends)
         result["time_spends_seconds"] = str(time_spends)
-        result["run_id"] = benchmark_run_id
+        result["run_id"] = run_id
         return result
 
     def do_benchmark(
@@ -706,9 +724,11 @@ class Agent:
                     output_dir=output_dir,
                     current_date=self.args.current_date,
                     tables=use_tables,
-                    external_knowledge=""
-                    if not benchmark_config.ext_knowledge_key
-                    else task_item.get(benchmark_config.ext_knowledge_key, ""),
+                    external_knowledge=(
+                        ""
+                        if not benchmark_config.ext_knowledge_key
+                        else task_item.get(benchmark_config.ext_knowledge_key, "")
+                    ),
                     schema_linking_type="full",
                 ),
                 check_storage=False,
@@ -828,11 +848,9 @@ class Agent:
         gold_path = os.path.join(benchmark_path, "gold")
         if os.path.exists(gold_path):
             logger.info(f"Cleaning up gold directory: {gold_path}")
-            try:
-                shutil.rmtree(gold_path)
-                logger.info(f"Successfully removed gold directory: {gold_path}")
-            except Exception as e:
-                logger.warning(f"Failed to clean gold directory {gold_path}: {e}")
+            force = self._force_delete
+            if not safe_rmtree(gold_path, "benchmark gold directory", force=force):
+                logger.warning("Gold directory not deleted, benchmark will proceed with existing gold data")
 
     def benchmark_bird_critic(self):
         pass
@@ -1008,3 +1026,99 @@ class Agent:
             "format": output_format,
             "filtered_task_ids": allowed_task_ids,
         }
+
+
+def bootstrap_platform_doc(args: argparse.Namespace, agent_config: AgentConfig):
+    """Initialize platform documentation (namespace-independent).
+
+    Standalone function that uses AgentConfig for path resolution but does NOT
+    require a valid namespace or Agent instance.
+
+    Parameters are resolved with: CLI args > YAML config (agent.document.{platform}) > defaults.
+
+    Returns:
+        InitResult on success/failure, or None if no document source is configured.
+    """
+    from datus.configuration.agent_config import DocumentConfig
+    from datus.storage.document import infer_platform_from_source, init_platform_docs
+
+    update_strategy = getattr(args, "update_strategy", "check")
+    pool_size = getattr(args, "pool_size", 4) or 4
+    doc_platform = getattr(args, "platform", None)
+
+    # Merge: YAML config as base, CLI args override non-None values
+    # If platform is not specified, try to resolve from YAML config or source
+    if not doc_platform:
+        source_from_cli = getattr(args, "source", None)
+        if source_from_cli:
+            doc_platform = infer_platform_from_source(source_from_cli)
+        if not doc_platform:
+            # Try single-entry YAML config: if only one platform is configured, use it
+            if len(agent_config.document_configs) == 1:
+                doc_platform = next(iter(agent_config.document_configs))
+            else:
+                print(
+                    "\n[ERROR] Cannot determine platform name."
+                    "\n  Use --platform <name> to specify, or provide --source to auto-detect."
+                    "\n  Examples: --platform polaris, --platform snowflake"
+                )
+                return None
+
+    base_cfg = agent_config.document_configs.get(doc_platform, DocumentConfig())
+    cfg = base_cfg.merge_cli_args(args)
+
+    dir_path = agent_config.document_storage_path(doc_platform)
+
+    if not cfg.source:
+        print(f"\nPlatform Doc: skipped (no document source configured for '{doc_platform}')")
+        return None
+
+    logger.info(f"Initializing document from {cfg.source} (type: {cfg.type})")
+
+    result = init_platform_docs(
+        db_path=dir_path,
+        platform=doc_platform,
+        cfg=cfg,
+        build_mode=update_strategy,
+        pool_size=pool_size,
+    )
+    _print_platform_doc_result(result, update_strategy)
+
+    return result
+
+
+def _print_platform_doc_result(result, mode: str) -> None:
+    """Pretty-print platform-doc result for the user."""
+    if result is None:
+        print("\nPlatform Doc: skipped (no document source configured)")
+        return
+
+    label = "Check" if mode == "check" else "Bootstrap"
+    if result.success:
+        print(f"\n[OK] Platform Doc {label} Complete")
+        print(f"  Platform:   {result.platform}")
+
+        if result.version_details:
+            if len(result.version_details) == 1:
+                vd = result.version_details[0]
+                print(f"  Version:    {vd.version}")
+                print(f"  Documents:  {vd.doc_count}")
+                print(f"  Chunks:     {vd.chunk_count}")
+            else:
+                print(f"  Versions:   {len(result.version_details)}")
+                for vd in result.version_details:
+                    print(f"    - {vd.version:20s}  docs: {vd.doc_count:<6d}  chunks: {vd.chunk_count}")
+                print(f"  Total:      {result.total_docs} docs, {result.total_chunks} chunks")
+        else:
+            print(f"  Version:    {result.version}")
+            print(f"  Documents:  {result.total_docs}")
+            print(f"  Chunks:     {result.total_chunks}")
+
+        if mode != "check":
+            print(f"  Source:     {result.source}")
+            print(f"  Duration:   {result.duration_seconds:.1f}s")
+    else:
+        print(f"\n[FAILED] Platform Doc {label} Failed")
+        print(f"  Platform:   {result.platform}")
+        for err in result.errors:
+            print(f"  Error:      {err}")

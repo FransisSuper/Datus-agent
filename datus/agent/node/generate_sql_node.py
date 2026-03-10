@@ -14,7 +14,6 @@ from datus.prompts.gen_sql import get_sql_prompt
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.node_models import GenerateSQLInput, GenerateSQLResult, SQLContext, SqlTask, TableSchema, TableValue
 from datus.storage.schema_metadata import SchemaWithValueRAG
-from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
 from datus.utils.time_utils import get_default_current_date
 from datus.utils.traceable_utils import optional_traceable
@@ -166,9 +165,11 @@ class GenerateSQLNode(Node):
                 action_type="sql_preparation",
                 input={
                     "database_type": self.input.database_type if hasattr(self.input, "database_type") else "",
-                    "table_count": len(self.input.table_schemas)
-                    if hasattr(self.input, "table_schemas") and self.input.table_schemas
-                    else 0,
+                    "table_count": (
+                        len(self.input.table_schemas)
+                        if hasattr(self.input, "table_schemas") and self.input.table_schemas
+                        else 0
+                    ),
                     "has_metrics": bool(hasattr(self.input, "metrics") and self.input.metrics),
                     "has_external_knowledge": bool(
                         hasattr(self.input, "external_knowledge") and self.input.external_knowledge
@@ -197,9 +198,9 @@ class GenerateSQLNode(Node):
                 messages="Generating SQL query based on schema and requirements",
                 action_type="sql_generation",
                 input={
-                    "task_description": getattr(self.input.sql_task, "task", "")
-                    if hasattr(self.input, "sql_task")
-                    else "",
+                    "task_description": (
+                        getattr(self.input.sql_task, "task", "") if hasattr(self.input, "sql_task") else ""
+                    ),
                     "database_type": self.input.database_type if hasattr(self.input, "database_type") else "",
                 },
                 status=ActionStatus.PROCESSING,
@@ -245,7 +246,7 @@ def generate_sql(model: LLMBaseModel, input_data: GenerateSQLInput) -> GenerateS
     try:
         # Format the prompt with schema list
         prompt = get_sql_prompt(
-            database_type=input_data.database_type or DBType.SQLITE.value,
+            database_type=input_data.database_type or "sqlite",
             table_schemas=input_data.table_schemas,
             data_details=input_data.data_details,
             metrics=input_data.metrics,

@@ -13,6 +13,7 @@ maximizing reuse of existing Datus CLI components including:
 - CollapsibleActionContentGenerator for detail views
 """
 
+import asyncio
 import csv
 import math
 import os
@@ -36,6 +37,37 @@ from datus.models.session_manager import SessionManager
 from datus.schemas.action_history import ActionHistory
 from datus.schemas.node_models import ExecuteSQLResult
 from datus.utils.loggings import configure_logging, setup_web_chatbot_logging
+
+
+def _run_async(coro):
+    """Run a coroutine safely regardless of event-loop state.
+
+    ``asyncio.run()`` fails with *RuntimeError: Event loop is closed* when
+    called inside environments that manage their own loop (Streamlit, PyCharm
+    debugger with ``nest_asyncio``, etc.).  This helper handles that case.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        # No current loop or closed – create a fresh one explicitly
+        # (asyncio.run may be patched by nest_asyncio and still hit the closed loop)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    if loop.is_running():
+        # We're inside a running loop – create a task instead of nesting
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return loop.run_until_complete(coro)
+
 
 # Logging setup shared with CLI entry point
 logger = structlog.get_logger("web_chatbot")
@@ -159,7 +191,7 @@ class StreamlitChatbot:
             logger.error(f"Configuration loading error: {e}")
             return False
 
-    def render_sidebar(self) -> Dict[str, Any]:
+    def render_sidebar(self) -> Dict[str, Any]:  # pragma: no cover
         """Render sidebar with configuration information"""
         # Skip sidebar rendering in embed mode, but keep config loading
         if self.should_hide_sidebar:
@@ -247,7 +279,7 @@ class StreamlitChatbot:
 
                 # Session info
                 if self.cli.chat_commands and self.cli.chat_commands.chat_node:
-                    session_info = self.cli.chat_commands.chat_node.get_session_info()
+                    session_info = _run_async(self.cli.chat_commands.chat_node.get_session_info())
                     col1, col2 = st.columns(2)
                     with col1:
                         st.metric("Messages", session_info.get("action_count", 0))
@@ -419,16 +451,96 @@ class StreamlitChatbot:
             st.error(f"Failed to save success story: {e}")
             logger.error(f"Failed to save success story: {e}")
 
+    def resume_session(self, session_id: str) -> bool:
+        """
+        Resume a previous session, enabling continued conversation.
+
+        Args:
+            session_id: The session ID to resume
+
+        Returns:
+            True if session was successfully resumed, False otherwise
+        """
+        # Verify session exists
+        if not self.session_manager.session_exists(session_id):
+            st.error(f"Session {session_id} not found or has no data.")
+            logger.warning(f"Attempted to resume non-existent session: {session_id}")
+            return False
+
+        if not self.cli or not self.cli.chat_commands:
+            st.error("CLI not initialized. Please wait for configuration to load.")
+            return False
+
+        try:
+            # Load messages for display
+            messages = self.get_session_messages(session_id)
+
+            # Extract node type from session_id to determine subagent
+            from datus.cli.chat_commands import ChatCommands
+
+            node_name = ChatCommands._extract_node_type_from_session_id(session_id)
+            subagent_name = node_name if node_name != "chat" else None
+
+            # Create a new node of the appropriate type
+            new_node = self.cli.chat_commands._create_new_node(subagent_name)
+            new_node.session_id = session_id
+
+            # Update CLI state
+            self.cli.chat_commands.current_node = new_node
+            self.cli.chat_commands.current_subagent_name = subagent_name
+            if not subagent_name:
+                self.cli.chat_commands.chat_node = new_node
+
+            # Update Streamlit session state
+            st.session_state.messages = messages if messages else []
+            st.session_state.view_session_id = session_id
+            st.session_state.session_readonly_mode = False
+
+            logger.info(f"Resumed session {session_id} with {len(messages)} messages")
+            return True
+
+        except Exception as e:
+            st.error(f"Failed to resume session: {e}")
+            logger.error(f"Failed to resume session {session_id}: {e}")
+            return False
+
+    def _handle_rewind(self, user_turn: int, include_response: bool):
+        """Create a new session rewound to the given user turn and switch to it."""
+        session_id = self.get_current_session_id()
+        if not session_id:
+            st.error("No active session to rewind.")
+            return
+
+        try:
+            new_session_id = self.session_manager.rewind_session(
+                session_id, user_turn, include_assistant_response=include_response
+            )
+            if not self.resume_session(new_session_id):
+                st.error("Failed to resume the rewound session.")
+                return
+            # Update URL query params so load_session_from_url() won't reload the old session
+            self.ui.safe_update_query_params({"session": new_session_id, "mode": "resume"})
+            st.session_state._loaded_session_mode = "resume"
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to rewind session: {e}")
+            logger.error(f"Rewind failed for session {session_id}: {e}")
+
     def load_session_from_url(self):
         """
         Load a session from URL query parameter if present.
-        Sets the app to read-only mode when viewing a shared session.
+        Supports two modes via ?mode= parameter:
+        - readonly (default): View-only mode for shared sessions
+        - resume: Resume the session for continued conversation
         """
         # Check URL query params for session parameter
         session_id = st.query_params.get("session")
+        mode = st.query_params.get("mode", "readonly")
 
-        # Check if we've already loaded this specific session
-        if st.session_state.get("view_session_id") == session_id:
+        # Check if we've already loaded this specific session with the same mode
+        loaded_session = st.session_state.get("view_session_id")
+        loaded_mode = st.session_state.get("_loaded_session_mode")
+        if loaded_session == session_id and loaded_mode == mode:
             return
         if not session_id:
             return
@@ -439,7 +551,13 @@ class StreamlitChatbot:
             logger.warning(f"Attempted to load non-existent session: {session_id}")
             return
 
-        # Load messages from session
+        # Resume mode: use resume_session() to enable continued conversation
+        if mode == "resume":
+            if self.resume_session(session_id):
+                st.session_state._loaded_session_mode = "resume"
+            return
+
+        # Default: read-only mode
         try:
             messages = self.get_session_messages(session_id)
             if not messages:
@@ -450,6 +568,7 @@ class StreamlitChatbot:
             st.session_state.messages = messages
             st.session_state.view_session_id = session_id
             st.session_state.session_readonly_mode = True
+            st.session_state._loaded_session_mode = "readonly"
 
             logger.info(f"Loaded session {session_id} with {len(messages)} messages in read-only mode")
 
@@ -473,7 +592,9 @@ class StreamlitChatbot:
         self._store_session_id()
         # Note: actions are stored in session_state by caller
 
-    def do_download(self, sql: str, markdown: str, data: ExecuteSQLResult, sql_id: Optional[str], display_column):
+    def do_download(
+        self, sql: str, markdown: str, data: ExecuteSQLResult, sql_id: Optional[str], display_column
+    ):  # pragma: no cover
         """Execute SQL, build a multi-sheet Excel workbook, and expose it for download."""
 
         if not sql_id:
@@ -593,7 +714,7 @@ class StreamlitChatbot:
                 disabled=not df.empty and len(df) > self.cli.agent_config.max_export_lines,
             )
 
-    def run(self):
+    def run(self):  # pragma: no cover
         """Main Streamlit app runner"""
         # Read query params and update session_state
         hide_param = st.query_params.get("hide_sidebar")
@@ -685,7 +806,14 @@ class StreamlitChatbot:
         # Show read-only banner if viewing shared session
         if st.session_state.session_readonly_mode:
             session_id_short = st.session_state.view_session_id[:8] if st.session_state.view_session_id else "unknown"
-            st.info(f"📖 Viewing Shared Session (Read-Only) - ID: {session_id_short}...")
+            col_banner, col_btn = st.columns([4, 1])
+            with col_banner:
+                st.info(f"📖 Viewing Shared Session (Read-Only) - ID: {session_id_short}...")
+            with col_btn:
+                if st.button("▶ Continue This Session", type="primary", use_container_width=True):
+                    view_sid = st.session_state.view_session_id
+                    if view_sid and self.resume_session(view_sid):
+                        st.rerun()
 
         # Title and description with subagent support - detect directly from URL
         if self.current_subagent:
@@ -707,32 +835,84 @@ class StreamlitChatbot:
             st.info("Configuration file contains database connections, model settings, etc.")
             return
         self.ui.reset_sql_display_state()
+
+        # Handle pending rewind request
+        rewind_request = st.session_state.pop("rewind_request", None)
+        if rewind_request:
+            self._handle_rewind(rewind_request["turn"], rewind_request["include_response"])
+
         self._display_chat_actions()
 
         if not self.cli or not self.cli.chat_commands:
             st.warning("⚠️ Something went wrong, please try restarting.")
             return
-        # Chat input - disabled in read-only mode
-        if not st.session_state.session_readonly_mode:
-            if prompt := st.chat_input("Enter your data query question..."):
-                # Create unique chat ID for this conversation
-                import uuid
+        # ── Chat input bar: text_input + Send/Stop button via st.form ──
+        # st.form lets Enter submit, and clear_on_submit prevents double-send.
+        # Run 1 (idle):  [input] [Send]  → user submits → save prompt, is_running=True, rerun
+        # Run 2 (running): [disabled input] [Stop]  → execute pending_prompt
+        #   user clicks Stop → Streamlit interrupts Run 2, starts Run 3
+        # Run 3 (stop):  form submitted=True, is_running=True → fire stop, rerun
+        # Run 4 (idle):  [input] [Send]
+        is_running = st.session_state.get("is_running", False)
 
-                chat_id = str(uuid.uuid4())
-                st.session_state.current_chat_id = chat_id
+        if st.session_state.session_readonly_mode:
+            st.chat_input("Read-only mode - cannot send messages", disabled=True)
+        else:
+            with st.form("chat_form", clear_on_submit=True, border=False):
+                col_input, col_btn = st.columns([9, 1])
+                with col_input:
+                    user_input = st.text_input(
+                        "query",
+                        placeholder="Generating response..." if is_running else "Enter your data query question...",
+                        disabled=is_running,
+                        label_visibility="collapsed",
+                    )
+                with col_btn:
+                    if is_running:
+                        submitted = st.form_submit_button("⏹ Stop", type="primary", use_container_width=True)
+                    else:
+                        submitted = st.form_submit_button("Send", type="primary", use_container_width=True)
 
-                # Add user message to chat history
-                st.session_state.messages.append({"role": "user", "content": prompt, "chat_id": chat_id})
+            # Handle form submission
+            if submitted:
+                if is_running:
+                    # Stop: trigger interrupt and clear running state
+                    if "interrupt_controller" in st.session_state:
+                        st.session_state.interrupt_controller.interrupt()
+                    st.session_state.is_running = False
+                    st.session_state.pop("pending_prompt", None)
+                    st.rerun()
+                elif user_input and user_input.strip():
+                    # Send: save prompt, set running, rerun so Stop button renders first
+                    st.session_state.pending_prompt = user_input.strip()
+                    st.session_state.is_running = True
+                    st.rerun()
 
-                # Display user message
-                with st.chat_message("user"):
-                    st.markdown(prompt)
+        # ── Execute pending prompt (runs on the rerun after submission) ──
+        pending_prompt = st.session_state.pop("pending_prompt", None)
+        if pending_prompt and st.session_state.get("is_running", False):
+            import uuid
 
-                # Generate assistant response
+            chat_id = str(uuid.uuid4())
+            st.session_state.current_chat_id = chat_id
+
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": pending_prompt, "chat_id": chat_id})
+
+            # Display user message
+            with st.chat_message("user"):
+                st.markdown(pending_prompt)
+
+            # Generate assistant response
+            try:
                 with st.chat_message("assistant"):
-                    # Use status container for progress display
                     status_placeholder = st.empty()
                     progress_messages = []
+
+                    # Store interrupt controller in session_state for Stop button
+                    current_node = self.cli.chat_commands.current_node if self.cli and self.cli.chat_commands else None
+                    if current_node and hasattr(current_node, "interrupt_controller"):
+                        st.session_state.interrupt_controller = current_node.interrupt_controller
 
                     with status_placeholder.container():
                         with st.status("Processing your query... ", expanded=True) as status:
@@ -741,54 +921,65 @@ class StreamlitChatbot:
 
                             content_generator = ActionContentGenerator(enable_truncation=False)
 
-                            for action in self.execute_chat_stream(prompt):
+                            stream_failed = False
+                            for action in self.execute_chat_stream(pending_prompt):
+                                if isinstance(action, str):
+                                    # Error messages from chat_executor are yielded as strings
+                                    st.error(action)
+                                    stream_failed = True
+                                    continue
                                 step_index += 1
                                 self.ui.render_action_item(chat_id, step_index, action, content_generator)
-                            status.update(label=f"✓ Completed {step_index} steps", state="complete", expanded=True)
-                    # Get complete actions from chat executor
-                    actions = self.chat_executor.last_actions
-                    logger.info(f"Chat execution completed: {len(actions) if actions else 0} actions collected")
+                            if stream_failed:
+                                status.update(label="✗ Failed", state="error", expanded=True)
+                            else:
+                                status.update(label=f"✓ Completed {step_index} steps", state="complete", expanded=True)
 
-                    # Extract SQL and response
-                    sql, response = self.extract_sql_and_response(actions)
+                    if not stream_failed:
+                        # Get complete actions from chat executor
+                        actions = self.chat_executor.last_actions
+                        logger.info(f"Chat execution completed: {len(actions) if actions else 0} actions collected")
 
-                    # Display final response
-                    if response:
-                        self.ui.display_markdown_response(response)
-                    else:
-                        st.markdown(
-                            "Sorry, unable to generate a valid response. "
-                            "Please check execution details for more information."
+                        # Extract SQL and response
+                        sql, response = self.extract_sql_and_response(actions)
+
+                        # Display final response
+                        if response:
+                            self.ui.display_markdown_response(response)
+                        else:
+                            st.markdown(
+                                "Sorry, unable to generate a valid response. "
+                                "Please check execution details for more information."
+                            )
+
+                        # Display SQL if available
+                        if sql:
+                            self.ui.display_sql(sql, self.cli.db_connector.execute_pandas(sql))
+
+                        # Display collapsed action history at bottom
+                        if actions:
+                            self.ui.render_action_history(actions, chat_id, expanded=False)
+
+                        # Save to chat history with complete data
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": response or "Unable to generate valid response",
+                            "sql": sql,
+                            "actions": actions,
+                            "chat_id": chat_id,
+                            "progress_messages": progress_messages,
+                        }
+                        logger.info(
+                            f"Saving message: chat_id={chat_id}, has_sql={sql is not None}, "
+                            f"actions_count={len(actions) if actions else 0}"
                         )
+                        st.session_state.messages.append(assistant_message)
+            finally:
+                st.session_state.is_running = False
+                # Clear stale interrupt controller to avoid leftover state
+                st.session_state.pop("interrupt_controller", None)
 
-                    # Display SQL if available
-                    if sql:
-                        self.ui.display_sql(sql, self.cli.db_connector.execute_pandas(sql))
-
-                    # # Display collapsed action history at bottom
-                    if actions:
-                        self.ui.render_action_history(actions, chat_id, expanded=False)
-
-                    # Save to chat history with complete data
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": response or "Unable to generate valid response",
-                        "sql": sql,
-                        "actions": actions,
-                        "chat_id": chat_id,
-                        "progress_messages": progress_messages,
-                    }
-                    logger.info(
-                        f"Saving message: chat_id={chat_id}, has_sql={sql is not None}, "
-                        f"actions_count={len(actions) if actions else 0}"
-                    )
-                    st.session_state.messages.append(assistant_message)
-
-                    # Trigger rerun to update sidebar with new session_id and display via history loop
-                    st.rerun()
-        else:
-            # Show disabled input in read-only mode
-            st.chat_input("Read-only mode - cannot send messages", disabled=True)
+            st.rerun()
 
         # Display conversation statistics
         if st.session_state.messages:
@@ -807,13 +998,18 @@ class StreamlitChatbot:
                 current_model = self.get_current_chat_model()
                 st.metric("Current Model", current_model)
 
-    def _display_chat_actions(self):
+    def _display_chat_actions(self):  # pragma: no cover
         # Display chat history
         readonly_mode = st.session_state.session_readonly_mode
         last_chat_id = None if not self.chat_executor.last_actions else self.chat_executor.last_actions[-1]["chat_id"]
+        user_turn_counter = 0
         for _, message in enumerate(st.session_state.messages):
             if last_chat_id and last_chat_id == message["chat_id"]:
                 continue
+
+            if message["role"] == "user":
+                user_turn_counter += 1
+
             with st.chat_message(message["role"]):
                 # Display user messages
                 if message["role"] == "user":
@@ -823,11 +1019,20 @@ class StreamlitChatbot:
                 elif message["role"] == "assistant":
                     # Different display based on readonly mode
                     if readonly_mode:
-                        # Session page: Only show expanded action history
+                        # Session page: Show expanded action history and content
                         actions_data = message.get("actions", [])
                         chat_id = message.get("chat_id", "default")
                         if actions_data:
                             self.ui.render_action_history(actions_data, chat_id, expanded=True)
+
+                        # Show AI response as markdown
+                        content = message.get("content", "")
+                        if content:
+                            self.ui.display_markdown_response(content)
+
+                        # Show SQL if available (readonly: display only, do not re-execute)
+                        if message.get("sql"):
+                            st.code(message["sql"], language="sql")
                     else:
                         # Normal page: Show progress summary, AI response, SQL, and collapsed details at bottom
                         # Show progress summary if available
@@ -856,12 +1061,28 @@ class StreamlitChatbot:
                             with col2:
                                 self.ui.display_download(sql, message["content"], data, col3, sql_id, self.do_download)
 
+                    # Rewind button (shown after each assistant response in non-readonly mode)
+                    if not readonly_mode and user_turn_counter > 0:
+                        turn_n = user_turn_counter
+                        with st.popover("⋯"):
+                            if st.button(f"⏪ Rewind to turn {turn_n}", key=f"rewind_{turn_n}"):
+                                st.session_state.rewind_request = {
+                                    "turn": turn_n,
+                                    "include_response": True,
+                                }
+                                st.rerun()
 
-def run_web_interface(args):
+
+def run_web_interface(args):  # pragma: no cover
     """Launch Streamlit web interface"""
     import os
     import subprocess
     import sys
+    from urllib.parse import quote_plus
+
+    from datus.utils.loggings import get_logger
+
+    logger = get_logger(__name__)
 
     try:
         # Get the path to the web chatbot
@@ -869,19 +1090,22 @@ def run_web_interface(args):
         web_chatbot_path = os.path.join(current_dir, "chatbot.py")
 
         if not os.path.exists(web_chatbot_path):
-            print(f"❌ Error: Web chatbot not found at {web_chatbot_path}")
+            logger.error(f"Web chatbot not found at {web_chatbot_path}")
             sys.exit(1)
 
-        print("🚀 Starting Datus Web Interface...")
+        logger.info("Starting Datus Web Interface...")
         if args.namespace:
-            print(f"🔗 Using namespace: {args.namespace}")
+            logger.info(f"Using namespace: {args.namespace}")
         if args.config:
-            print(f"⚙️ Using config: {args.config}")
+            logger.info(f"Using config: {args.config}")
         if args.database:
-            print(f"📚 Using database: {args.database}")
-        print(f"🌐 Starting server at http://{args.host}:{args.port}")
-        print("⏹️ Press Ctrl+C to stop server")
-        print("-" * 50)
+            logger.info(f"Using database: {args.database}")
+        url = f"http://{args.host}:{args.port}"
+        if getattr(args, "subagent", ""):
+            url += f"/?subagent={quote_plus(args.subagent)}"
+        logger.info(f"Starting server at {url}")
+        logger.info("Press Ctrl+C to stop server")
+        logger.info("-" * 50)
 
         # Prepare streamlit command
         cmd = [
@@ -908,6 +1132,8 @@ def run_web_interface(args):
             web_args.extend(["--database", args.database])
         if getattr(args, "debug", False):
             web_args.append("--debug")
+        if getattr(args, "subagent", ""):
+            web_args.extend(["--subagent", args.subagent])
 
         if web_args:
             cmd.extend(["--"] + web_args)
@@ -922,7 +1148,7 @@ def run_web_interface(args):
         sys.exit(1)
 
 
-def main():
+def main():  # pragma: no cover
     """Main entry point"""
     import sys
 
@@ -950,13 +1176,17 @@ def main():
             config_path = sys.argv[i + 1]
         elif arg == "--database" and i + 1 < len(sys.argv):
             database = sys.argv[i + 1]
+        elif arg == "--subagent" and i + 1 < len(sys.argv):
+            subagent_name = sys.argv[i + 1]
         elif arg == "--debug":
             debug = True
 
     # Initialize logging once per process
     initialize_logging(debug=debug)
 
-    # Note: Subagent detection is now handled directly in the interface, not here
+    # Set subagent query param from CLI arg so existing URL-based logic picks it up
+    if subagent_name and not st.query_params.get("subagent"):
+        st.query_params["subagent"] = subagent_name
 
     # Store in session state for use by the app
     if "startup_namespace" not in st.session_state:

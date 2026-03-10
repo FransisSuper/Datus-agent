@@ -43,6 +43,7 @@ class LLMBaseModel(ABC):  # Changed from BaseModel to LLMBaseModel
         LLMProvider.OPENAI: "OpenAIModel",
         LLMProvider.CLAUDE: "ClaudeModel",
         LLMProvider.GEMINI: "GeminiModel",
+        LLMProvider.KIMI: "KimiModel",
     }
 
     def __init__(self, model_config: ModelConfig):
@@ -137,6 +138,7 @@ class LLMBaseModel(ABC):  # Changed from BaseModel to LLMBaseModel
         session: Optional[SQLiteSession] = None,
         action_history_manager: Optional[ActionHistoryManager] = None,
         hooks=None,
+        interrupt_controller=None,
         **kwargs,
     ) -> AsyncGenerator[ActionHistory, None]:
         """Generate response with streaming and tool support.

@@ -16,6 +16,7 @@ from datus.schemas.action_history import ActionHistoryManager, ActionStatus
 from datus.schemas.batch_events import BatchEvent, BatchStage
 from datus.schemas.semantic_agentic_node_models import SemanticNodeInput
 from datus.utils.loggings import get_logger
+from datus.utils.terminal_utils import suppress_keyboard_input
 
 logger = get_logger(__name__)
 
@@ -124,7 +125,7 @@ def init_success_story_semantic_model(
                         BatchEvent(
                             biz_name="semantic_model_init",
                             stage=BatchStage.ITEM_PROCESSING,
-                            payload={"messages": action.messages},
+                            payload={"messages": action.messages, "output": action.output},
                         )
                     )
 
@@ -157,7 +158,8 @@ def init_success_story_semantic_model(
                 emit(BatchEvent(biz_name="semantic_model_init", stage=BatchStage.TASK_FAILED, error=error_msg))
             return False, error_msg
 
-    successful, error_message = asyncio.run(generate_semantic_models())
+    with suppress_keyboard_input():
+        successful, error_message = asyncio.run(generate_semantic_models())
     return successful, error_message
 
 
@@ -186,7 +188,7 @@ def process_semantic_yaml_file(
     include_metrics: bool = True,
 ) -> tuple[bool, str]:
     """
-    Process semantic YAML file by directly syncing to LanceDB using GenerationHooks.
+    Process semantic YAML file by directly syncing to vector store using GenerationHooks.
 
     Args:
         yaml_file_path: Path to semantic YAML file
@@ -218,15 +220,15 @@ def process_semantic_yaml_file(
             include_metrics=include_metrics,
         )
     except Exception as e:
-        error_msg = f"Failed to sync semantic YAML file '{yaml_file_path}' to LanceDB: {e}"
+        error_msg = f"Failed to sync semantic YAML file '{yaml_file_path}' to vector store: {e}"
         logger.exception(error_msg)
         return False, error_msg
 
     if result.get("success"):
-        logger.info(f"Successfully synced to LanceDB: {result.get('message')}")
+        logger.info(f"Successfully synced to vector store: {result.get('message')}")
         return True, ""
     else:
         error = result.get("error", "Unknown error")
-        error_msg = f"Failed to sync '{yaml_file_path}' to LanceDB: {error}"
+        error_msg = f"Failed to sync '{yaml_file_path}' to vector store: {error}"
         logger.error(error_msg)
         return False, error

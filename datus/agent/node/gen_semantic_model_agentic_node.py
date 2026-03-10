@@ -13,6 +13,7 @@ database tools, hooks, and metricflow MCP server integration.
 from typing import AsyncGenerator, Literal, Optional
 
 from datus.agent.node.agentic_node import AgenticNode
+from datus.cli.execution_state import ExecutionInterrupted
 from datus.cli.generation_hooks import GenerationHooks
 from datus.configuration.agent_config import AgentConfig
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
@@ -23,6 +24,7 @@ from datus.tools.func_tool.filesystem_tools import FilesystemFuncTool
 from datus.tools.func_tool.gen_semantic_model_tools import GenSemanticModelTools
 from datus.tools.func_tool.generation_tools import GenerationTools
 from datus.utils.loggings import get_logger
+from datus.utils.message_utils import MessagePart, build_structured_content
 from datus.utils.path_manager import get_path_manager
 
 logger = get_logger(__name__)
@@ -214,10 +216,8 @@ class GenSemanticModelAgenticNode(AgenticNode):
     def _setup_hooks(self):
         """Setup hooks for interactive mode."""
         try:
-            from rich.console import Console
-
-            console = Console()
-            self.hooks = GenerationHooks(console=console, agent_config=self.agent_config)
+            broker = self._get_or_create_broker()
+            self.hooks = GenerationHooks(broker=broker, agent_config=self.agent_config)
             logger.info("Setup hooks: generation_hooks")
         except Exception as e:
             logger.error(f"Failed to setup generation_hooks: {e}")
@@ -294,7 +294,8 @@ class GenSemanticModelAgenticNode(AgenticNode):
             # Use prompt manager to render the template
             from datus.prompts.prompt_manager import prompt_manager
 
-            return prompt_manager.render_template(template_name=template_name, version=version, **template_vars)
+            base_prompt = prompt_manager.render_template(template_name=template_name, version=version, **template_vars)
+            return self._finalize_system_prompt(base_prompt)
 
         except FileNotFoundError as e:
             # Template not found - throw DatusException
@@ -380,18 +381,13 @@ class GenSemanticModelAgenticNode(AgenticNode):
                 enhanced_parts.append(context_part_str)
 
             if enhanced_parts:
-                enhanced_message = f"{'\\n\\n'.join(enhanced_parts)}\\n\\nUser question: {user_input.user_message}"
-
-            # Create assistant action for processing
-            assistant_action = ActionHistory.create_action(
-                role=ActionRole.ASSISTANT,
-                action_type="llm_generation",
-                messages="Generating response with tools...",
-                input_data={"prompt": enhanced_message, "system": system_instruction},
-                status=ActionStatus.PROCESSING,
-            )
-            action_history_manager.add_action(assistant_action)
-            yield assistant_action
+                enhanced_context = "\n\n".join(enhanced_parts)
+                enhanced_message = build_structured_content(
+                    [
+                        MessagePart(type="enhanced", content=enhanced_context),
+                        MessagePart(type="user", content=user_input.user_message),
+                    ]
+                )
 
             logger.debug(f"Tools available : {len(self.tools)} tools - {[tool.name for tool in self.tools]}")
             logger.debug(f"MCP servers available : {len(self.mcp_servers)} servers - {list(self.mcp_servers.keys())}")
@@ -413,6 +409,7 @@ class GenSemanticModelAgenticNode(AgenticNode):
                 session=session,
                 action_history_manager=action_history_manager,
                 hooks=self.hooks if self.execution_mode == "interactive" else None,
+                interrupt_controller=self.interrupt_controller,
             ):
                 yield stream_action
 
@@ -461,12 +458,8 @@ class GenSemanticModelAgenticNode(AgenticNode):
                         if action.output and isinstance(action.output, dict):
                             usage_info = action.output.get("usage", {})
                             if usage_info and isinstance(usage_info, dict) and usage_info.get("total_tokens"):
-                                conversation_tokens = usage_info.get("total_tokens", 0)
-                                if conversation_tokens > 0:
-                                    # Add this conversation's tokens to the session
-                                    self._add_session_tokens(conversation_tokens)
-                                    tokens_used = conversation_tokens
-                                    logger.info(f"Added {conversation_tokens} tokens to session")
+                                tokens_used = usage_info.get("total_tokens", 0)
+                                if tokens_used > 0:
                                     break
                                 else:
                                     logger.warning(f"no usage token found in this action {action.messages}")
@@ -507,6 +500,9 @@ class GenSemanticModelAgenticNode(AgenticNode):
             )
             action_history_manager.add_action(final_action)
             yield final_action
+
+        except ExecutionInterrupted:
+            raise
 
         except Exception as e:
             logger.error(f"{self.get_node_name()} execution error: {e}")

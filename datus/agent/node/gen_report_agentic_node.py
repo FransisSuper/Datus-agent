@@ -13,6 +13,7 @@ or extended by specialized report nodes like AttributionAgenticNode.
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from datus.agent.node.agentic_node import AgenticNode
+from datus.cli.execution_state import ExecutionInterrupted
 from datus.configuration.agent_config import AgentConfig
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.gen_report_agentic_node_models import GenReportNodeInput, GenReportNodeResult
@@ -20,6 +21,7 @@ from datus.tools.db_tools.db_manager import db_manager_instance
 from datus.tools.func_tool import ContextSearchTools, DBFuncTool
 from datus.tools.func_tool.semantic_tools import SemanticTools
 from datus.utils.loggings import get_logger
+from datus.utils.message_utils import MessagePart, build_structured_content
 
 logger = get_logger(__name__)
 
@@ -295,14 +297,16 @@ class GenReportAgenticNode(AgenticNode):
         from datus.prompts.prompt_manager import prompt_manager
 
         try:
-            return prompt_manager.render_template(template_name=template_name, version=version, **context)
+            base_prompt = prompt_manager.render_template(template_name=template_name, version=version, **context)
 
         except FileNotFoundError:
             # Template not found - use default gen_report template
             logger.warning(
                 f"Failed to render system prompt '{system_prompt_name}', using the default gen_report template"
             )
-            return prompt_manager.render_template(template_name="gen_report_system", version=version, **context)
+            base_prompt = prompt_manager.render_template(template_name="gen_report_system", version=version, **context)
+
+        return self._finalize_system_prompt(base_prompt)
 
     def _build_enhanced_message(self, user_input: GenReportNodeInput) -> str:
         """
@@ -315,17 +319,26 @@ class GenReportAgenticNode(AgenticNode):
             user_input: Report node input
 
         Returns:
-            Enhanced message string with context
+            Enhanced message string with context (structured JSON format)
         """
-        parts = [f"Question: {user_input.user_message}"]
+        enhanced_parts = []
 
         # Add database context
         if user_input.database:
-            parts.append(f"\nDatabase context: {user_input.database}")
+            enhanced_parts.append(f"Database context: {user_input.database}")
         if user_input.db_schema:
-            parts.append(f"Schema: {user_input.db_schema}")
+            enhanced_parts.append(f"Schema: {user_input.db_schema}")
 
-        return "\n".join(parts)
+        if enhanced_parts:
+            enhanced_context = chr(10).join(enhanced_parts)
+            return build_structured_content(
+                [
+                    MessagePart(type="enhanced", content=enhanced_context),
+                    MessagePart(type="user", content=user_input.user_message),
+                ]
+            )
+
+        return user_input.user_message
 
     def _extract_report_result(self, actions: List[ActionHistory]) -> Optional[Dict[str, Any]]:
         """
@@ -460,17 +473,6 @@ class GenReportAgenticNode(AgenticNode):
             tokens_used = 0
             last_successful_output = None
 
-            # Create assistant action for processing
-            assistant_action = ActionHistory.create_action(
-                role=ActionRole.ASSISTANT,
-                action_type="llm_generation",
-                messages="Analyzing data and generating report...",
-                input_data={"prompt": enhanced_message, "system": system_instruction},
-                status=ActionStatus.PROCESSING,
-            )
-            action_history_manager.add_action(assistant_action)
-            yield assistant_action
-
             logger.debug(f"Tools available: {len(self.tools)} tools - {[tool.name for tool in self.tools]}")
 
             # Stream response using model's generate_with_tools_stream
@@ -482,6 +484,7 @@ class GenReportAgenticNode(AgenticNode):
                 max_turns=self.max_turns,
                 session=session,
                 action_history_manager=action_history_manager,
+                interrupt_controller=self.interrupt_controller,
             ):
                 # Collect response content from successful actions
                 if stream_action.status == ActionStatus.SUCCESS and stream_action.output:
@@ -551,7 +554,6 @@ class GenReportAgenticNode(AgenticNode):
                         usage_info = action.output.get("usage", {})
                         if usage_info and isinstance(usage_info, dict) and usage_info.get("total_tokens"):
                             tokens_used = usage_info.get("total_tokens", 0)
-                            self._add_session_tokens(tokens_used)
                             break
 
             # Collect execution stats
@@ -591,6 +593,9 @@ class GenReportAgenticNode(AgenticNode):
             )
             action_history_manager.add_action(final_action)
             yield final_action
+
+        except ExecutionInterrupted:
+            raise
 
         except Exception as e:
             logger.error(f"{self.get_node_name()} execution error: {e}")

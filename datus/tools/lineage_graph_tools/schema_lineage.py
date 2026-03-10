@@ -29,7 +29,7 @@ class SchemaLineageTool(BaseTool):
         """Initialize the schema lineage tool.
 
         Args:
-            db_path: Path to the LanceDB database directory
+            db_path: Path to the vector store database directory
         """
         super().__init__(**kwargs)
         if storage:
@@ -84,7 +84,7 @@ class SchemaLineageTool(BaseTool):
         return self._search_similar_schemas(input_param, input_param.top_n_by_rate())
 
     def _search_similar_schemas(self, input_param: SchemaLinkingInput, top_n: int = 5) -> SchemaLinkingResult:
-        (similar_schemas, similar_values) = self.store.search_similar(
+        similar_schemas, similar_values = self.store.search_similar(
             input_param.input_text,
             top_n=top_n,
             catalog_name=input_param.catalog_name,

@@ -12,12 +12,15 @@ Provides a consistent UI for displaying:
 - LLM output (maximized visibility)
 """
 
+import json
+import re
 from collections import deque
 from contextlib import contextmanager
 from typing import Optional
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
 from rich.text import Text
@@ -62,6 +65,12 @@ class StreamOutputManager:
         self.live: Optional[Live] = None
         self.progress_task: Optional[TaskID] = None
         self._is_running = False
+
+        # Store complete LLM output for markdown rendering (bounded to prevent memory growth)
+        self.full_output: deque[str] = deque(maxlen=500)
+
+        # Store extracted summary outputs separately for reliable rendering
+        self.summary_outputs: list[str] = []
 
     def _create_progress(self, total_items: int) -> Progress:
         """
@@ -111,7 +120,6 @@ class StreamOutputManager:
             console=self.console,
             refresh_per_second=4,  # Moderate refresh rate
             transient=False,
-            vertical_overflow="visible",  # Prevent line duplication on height changes
         )
         self.live.start()
         self._is_running = True
@@ -210,9 +218,12 @@ class StreamOutputManager:
         """
         Add LLM output (priority display, use special styles)
 
+        Also stores the complete output for later markdown rendering.
+
         Args:
             output: LLM output content
         """
+        self.full_output.append(output)
         self.add_message(output, style="white")
 
     def complete_task(self, success: bool = True, message: str = ""):
@@ -256,6 +267,90 @@ class StreamOutputManager:
             message: Success message
         """
         self.add_message(f"✓ {message}", style="green")
+
+    def add_summary_content(self, content: str):
+        """
+        Add content for summary rendering only (not displayed in scrolling window).
+
+        Use this to store structured output summaries that should appear in the
+        final markdown summary panel but not in the real-time scrolling display.
+
+        Args:
+            content: Summary text to display in the final summary panel
+        """
+        self.summary_outputs.append(content)
+
+    def render_markdown_summary(self, title: str = "Summary", last_n: Optional[int] = None):
+        """
+        Render complete markdown output after task completion.
+
+        Uses directly stored summary outputs if available (from add_summary_content),
+        otherwise falls back to extracting from full LLM output.
+
+        Args:
+            title: Title for the summary panel
+            last_n: If specified, only show the last N markdown outputs (useful for batch processing)
+        """
+        # Prefer explicitly stored summary outputs
+        if self.summary_outputs:
+            markdown_outputs = list(self.summary_outputs)
+        elif self.full_output:
+            # Fallback: extract from full LLM output
+            full_text = "\n".join(self.full_output)
+            markdown_outputs = self._extract_all_markdown_outputs(full_text)
+        else:
+            return
+
+        if not markdown_outputs:
+            self.full_output.clear()
+            self.summary_outputs.clear()
+            return
+
+        # If last_n specified, only show the last N outputs
+        if last_n is not None and last_n > 0:
+            markdown_outputs = markdown_outputs[-last_n:]
+
+        # Combine outputs with separators
+        markdown_content = "\n\n---\n\n".join(markdown_outputs)
+
+        if markdown_content:
+            md = Markdown(markdown_content)
+            self.console.print(Panel(md, title=f"📋 {title}", border_style="green"))
+
+        # Clear after rendering
+        self.full_output.clear()
+        self.summary_outputs.clear()
+
+    def _extract_all_markdown_outputs(self, text: str) -> list[str]:
+        """
+        Extract all markdown content from LLM output.
+
+        Finds all JSON blocks with 'output' field and returns their values.
+        Falls back to returning the original text if no JSON is found.
+
+        Args:
+            text: Raw LLM output text
+
+        Returns:
+            List of extracted markdown content strings
+        """
+        outputs = []
+
+        # Find all JSON blocks containing 'output' field
+        # Use a more flexible pattern to match JSON objects
+        json_pattern = r'\{[^{}]*"output"\s*:\s*"[^"]*"[^{}]*\}'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match)
+                if data.get("output"):
+                    outputs.append(data["output"])
+            except json.JSONDecodeError:
+                continue
+
+        # If no JSON outputs found, return empty list (don't dump raw text as summary)
+        return outputs
 
     def _render(self):
         """Render the entire output interface"""

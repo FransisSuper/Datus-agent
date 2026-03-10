@@ -32,7 +32,7 @@ class ArgumentParser:
         self.parser.add_argument(
             "--db_type",
             dest="db_type",
-            choices=[DBType.SQLITE, DBType.SNOWFLAKE, DBType.DUCKDB],
+            choices=[DBType.SQLITE, "snowflake", DBType.DUCKDB],
             default=DBType.SQLITE,
             help="Database type to connect to",
         )
@@ -94,6 +94,13 @@ class ArgumentParser:
             help="Host for web interface (default: localhost)",
         )
 
+        self.parser.add_argument(
+            "--subagent",
+            type=str,
+            default="",
+            help="Subagent name to open directly (for web mode)",
+        )
+
     def parse_args(self):
         return self.parser.parse_args()
 
@@ -126,6 +133,19 @@ class Application:
 
 def main():
     """Entry point for console scripts"""
+    import sys
+
+    # Intercept 'skill' subcommand and delegate to datus.main's skill handler
+    if len(sys.argv) > 1 and sys.argv[1] == "skill":
+        from datus.main import create_parser as create_main_parser
+
+        parser = create_main_parser()
+        args = parser.parse_args()
+        configure_logging(getattr(args, "debug", False), console_output=False)
+        from datus.cli.skill_cli import run_skill_command
+
+        sys.exit(run_skill_command(args))
+
     app = Application()
     app.run()
 

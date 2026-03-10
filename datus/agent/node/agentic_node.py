@@ -14,22 +14,26 @@ from __future__ import annotations
 import asyncio
 import uuid
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 
-from agents import SQLiteSession, Tool
+from agents import Tool
+from agents.extensions.memory import AdvancedSQLiteSession
 from agents.mcp import MCPServerStdio
 
 from datus.agent.node.node import Node
+from datus.cli.execution_state import ExecutionInterrupted, InteractionBroker, InterruptController
 from datus.configuration.agent_config import AgentConfig
 from datus.models.base import LLMBaseModel
 from datus.prompts.prompt_manager import prompt_manager
-from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionStatus
+from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
 from datus.schemas.base import BaseInput, BaseResult
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
 
 if TYPE_CHECKING:
     from datus.agent.workflow import Workflow
+    from datus.tools.permission.permission_manager import PermissionManager
+    from datus.tools.skill_tools.skill_manager import SkillManager
 
 logger = get_logger(__name__)
 
@@ -69,19 +73,36 @@ class AgenticNode(Node):
         self.mcp_servers = mcp_servers or {}
         self.actions: List[ActionHistory] = []
         self.session_id: Optional[str] = None
-        self._session: Optional[SQLiteSession] = None
-        self._session_tokens: int = 0
+        self._session: Optional[AdvancedSQLiteSession] = None
         self.last_summary: Optional[str] = None
         self.context_length: Optional[int] = None
 
+        # Permission and skill management
+        self.permission_manager: Optional["PermissionManager"] = None
+        self.skill_manager: Optional["SkillManager"] = None
+        self.skill_func_tool = None
+        self._permission_callback: Optional[Callable[[str, str, Dict[str, Any]], Awaitable[bool]]] = None
+
         # Parse node configuration from agent.yml (available to all agentic nodes)
         self.node_config = self._parse_node_config(agent_config, self.get_node_name())
+
+        # Setup permission manager (after node_config is available)
+        self._setup_permission_manager()
+
+        # Setup skill manager (after permission_manager is available)
+        self._setup_skill_manager()
+
+        # Setup skill func tools for non-chat nodes when explicitly configured
+        self._setup_skill_func_tools()
 
         # Initialize model: use node-specific model if configured, otherwise use default from agent_config
         if agent_config:
             model_name = self.node_config.get("model")  # Can be None, which will use active_model()
             self.model = LLMBaseModel.create_model(model_name=model_name, agent_config=agent_config)
             self.context_length = self.model.context_length() if self.model else None
+
+        self.interaction_broker = InteractionBroker()
+        self.interrupt_controller = InterruptController()
 
     def get_node_name(self) -> str:
         """
@@ -132,7 +153,7 @@ class AgenticNode(Node):
 
         try:
             # Use prompt manager to render the template
-            return prompt_manager.render_template(
+            base_prompt = prompt_manager.render_template(
                 template_name=template_name,
                 version=version,
                 # Add common template variables
@@ -157,11 +178,37 @@ class AgenticNode(Node):
                 message_args={"config_error": f"Template loading failed for '{template_name}': {str(e)}"},
             ) from e
 
+        return self._finalize_system_prompt(base_prompt)
+
+    def _finalize_system_prompt(self, base_prompt: str) -> str:
+        """
+        Finalize system prompt by injecting skill context and ensuring skill tools.
+
+        All subclasses should call this at the end of their _get_system_prompt() override
+        to ensure skills are properly injected regardless of how the template is rendered.
+
+        Args:
+            base_prompt: The rendered template prompt
+
+        Returns:
+            Prompt with skills XML appended (if skill_func_tool is active)
+        """
+        # Ensure skill tools are in self.tools (lazy injection after subclass setup_tools()).
+        self._ensure_skill_tools_in_tools()
+
+        # Inject available skills XML into system prompt when skill_func_tool is active.
+        if self.skill_func_tool:
+            skills_xml = self._get_available_skills_context()
+            if skills_xml:
+                base_prompt = base_prompt + "\n\n" + skills_xml
+
+        return base_prompt
+
     def _generate_session_id(self) -> str:
         """Generate a unique session ID."""
         return f"{self.get_node_name()}_session_{str(uuid.uuid4())[:8]}"
 
-    def _get_or_create_session(self) -> tuple[SQLiteSession, Optional[str]]:
+    def _get_or_create_session(self) -> tuple[AdvancedSQLiteSession, Optional[str]]:
         """
         Get or create the session for this node.
 
@@ -190,41 +237,17 @@ class AgenticNode(Node):
 
         return self._session, summary
 
-    def _count_session_tokens(self) -> int:
+    async def _count_session_tokens(self) -> int:
         """
-        Count the total tokens in the current session.
-        Returns the cumulative token count stored in self._session_tokens.
+        Count the total tokens in the current session from turn_usage table.
 
         Returns:
             Total token count in the session
         """
-        return self._session_tokens
-
-    def _add_session_tokens(self, tokens_used: int) -> None:
-        """
-        Add tokens to the current session count.
-        Validates that the total doesn't exceed the model's context length.
-
-        Args:
-            tokens_used: Number of tokens to add to the session count
-        """
-        if tokens_used <= 0:
-            return
-
-        # Validate against context length if available
-        if self.context_length and (self._session_tokens + tokens_used) > self.context_length:
-            logger.warning(
-                f"Cannot add {tokens_used} tokens: would exceed context length "
-                f"({self._session_tokens + tokens_used} > {self.context_length})"
-            )
-            return
-
-        self._session_tokens += tokens_used
-        logger.debug(f"Added {tokens_used} tokens to session. Total: {self._session_tokens}")
-
-        # Update SQLite session with current token count via model's session manager
-        if self.model and hasattr(self.model, "session_manager") and self.session_id:
-            self.model.session_manager.update_session_tokens(self.session_id, self._session_tokens)
+        if self._session and hasattr(self._session, "get_session_usage"):
+            usage = await self._session.get_session_usage()
+            return usage.get("total_tokens", 0) if usage else 0
+        return 0
 
     async def _manual_compact(self) -> dict:
         """
@@ -243,7 +266,6 @@ class AgenticNode(Node):
 
             # Store old session info for logging
             old_session_id = self.session_id
-            old_tokens = self._session_tokens
 
             # 1. Generate summary using LLM with existing session
             summarization_prompt = (
@@ -281,12 +303,9 @@ class AgenticNode(Node):
             self.session_id = None
             self._session = None
 
-            # Reset token count for new session
-            self._session_tokens = 0
-
             logger.info(
                 f"Manual compacting completed. Cleared session: {old_session_id}, "
-                f"Token reset: {old_tokens} -> 0, Summary stored: {len(summary)} chars"
+                f"Summary stored: {len(summary)} chars"
             )
             return {"success": True, "summary": summary, "summary_token": summary_token}
 
@@ -305,11 +324,16 @@ class AgenticNode(Node):
             return False
 
         try:
-            current_tokens = self._count_session_tokens()
+            current_tokens = await self._count_session_tokens()
 
             if current_tokens > (self.context_length * 0.9):
                 logger.info(f"Auto-compacting triggered: {current_tokens}/{self.context_length} tokens")
-                return await self._manual_compact()  # Will reset tokens to 0
+                try:
+                    result = await self._manual_compact()
+                    return result.get("success", False)
+                except Exception as e:
+                    logger.error(f"Auto-compact manual compaction failed: {e}")
+                    return False
 
             return False
 
@@ -355,6 +379,8 @@ class AgenticNode(Node):
             "prompt_language",
             "tools",
             "mcp",
+            "skills",  # AgentSkills pattern filter (e.g., "sql-*, data-*")
+            "permissions",  # Node-specific permission overrides
             "hooks",
             "rules",
             "max_turns",
@@ -389,6 +415,217 @@ class AgenticNode(Node):
 
         logger.info(f"Parsed node configuration for '{node_name}': {config}")
         return config
+
+    def _setup_permission_manager(self) -> None:
+        """
+        Initialize unified permission manager for tools, MCP, and skills.
+
+        The permission manager uses global config from agent.yml and node-specific
+        overrides to control access to tools/MCP/skills with allow/deny/ask levels.
+        """
+        if not self.agent_config or not hasattr(self.agent_config, "permissions_config"):
+            return
+
+        permissions_config = self.agent_config.permissions_config
+        if not permissions_config:
+            return
+
+        try:
+            from datus.tools.permission.permission_manager import PermissionManager
+
+            # Get node-specific permission overrides from node_config
+            node_permissions = self.node_config.get("permissions", {})
+
+            self.permission_manager = PermissionManager(
+                global_config=permissions_config,
+                node_overrides={self.get_node_name(): node_permissions} if node_permissions else {},
+            )
+            # Forward existing callback to permission manager
+            if self._permission_callback:
+                self.permission_manager.set_permission_callback(self._permission_callback)
+            logger.debug(f"Permission manager initialized for node '{self.get_node_name()}'")
+
+        except Exception as e:
+            logger.exception("Failed to setup permission manager")
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Permission manager init failed: {e}"},
+            ) from e
+
+    def _setup_skill_manager(self) -> None:
+        """
+        Initialize skill manager from agent config.
+
+        The skill manager coordinates skill discovery, permission checking,
+        and content loading for the AgentSkills integration.
+        """
+        if not self.agent_config or not hasattr(self.agent_config, "skills_config"):
+            return
+
+        skills_config = self.agent_config.skills_config
+        if not skills_config:
+            return
+
+        try:
+            from datus.tools.skill_tools.skill_manager import SkillManager
+
+            self.skill_manager = SkillManager(
+                config=skills_config,
+                permission_manager=self.permission_manager,
+            )
+            logger.debug(
+                f"Skill manager initialized for node '{self.get_node_name()}' "
+                f"with {self.skill_manager.get_skill_count()} skills"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to setup skill manager: {e}")
+
+    def _setup_skill_func_tools(self) -> None:
+        """
+        Setup skill function tools when explicitly configured in agentic_nodes.
+
+        Only activates if 'skills' is explicitly set in node_config.
+        ChatAgenticNode overrides skill setup in its own setup_tools(), so this primarily
+        serves other AgenticNode subclasses (GenReport, GenMetrics, etc.).
+
+        If skill_manager was not created (e.g. no global 'skills:' section in agent.yml),
+        creates one with default SkillConfig (same behavior as ChatAgenticNode).
+
+        NOTE: This only creates the SkillFuncTool instance (self.skill_func_tool).
+        The actual tools are injected into self.tools lazily via _ensure_skill_tools_in_tools(),
+        which is called from _get_system_prompt(). This avoids a timing issue where subclass
+        setup_tools() resets self.tools = [] after __init__ completes.
+        """
+        skill_patterns_str = self.node_config.get("skills")
+        if not skill_patterns_str:
+            return
+
+        try:
+            # Create skill_manager with defaults if not already initialized
+            # (e.g. when agent.yml has no global 'skills:' section)
+            if not self.skill_manager:
+                from datus.tools.skill_tools.skill_manager import SkillManager
+
+                self.skill_manager = SkillManager(
+                    permission_manager=self.permission_manager,
+                )
+                logger.info(
+                    f"Created default SkillManager for node '{self.get_node_name()}' "
+                    f"with {self.skill_manager.get_skill_count()} skills"
+                )
+
+            from datus.tools.skill_tools.skill_func_tool import SkillFuncTool
+
+            self.skill_func_tool = SkillFuncTool(
+                manager=self.skill_manager,
+                node_name=self.get_node_name(),
+            )
+            logger.info(
+                f"Skill func tools activated for node '{self.get_node_name()}' " f"with pattern '{skill_patterns_str}'"
+            )
+        except Exception as e:
+            logger.error(f"Failed to setup skill func tools: {e}")
+
+    def _ensure_skill_tools_in_tools(self) -> None:
+        """
+        Ensure skill function tools are present in self.tools.
+
+        Called lazily (from _get_system_prompt) to avoid the timing issue where
+        subclass setup_tools() resets self.tools = [] after base __init__ runs.
+        Idempotent — safe to call multiple times.
+        """
+        if not self.skill_func_tool:
+            return
+
+        skill_tool_names = {t.name for t in self.skill_func_tool.available_tools()}
+        existing_names = {t.name for t in (self.tools or [])}
+
+        if skill_tool_names.issubset(existing_names):
+            return  # Already added
+
+        if self.tools is None:
+            self.tools = []
+        self.tools.extend(self.skill_func_tool.available_tools())
+        logger.info(
+            f"Skill tools injected into node '{self.get_node_name()}': "
+            f"{[t.name for t in self.skill_func_tool.available_tools()]}"
+        )
+
+    def set_permission_callback(self, callback: Callable[[str, str, Dict[str, Any]], Awaitable[bool]]) -> None:
+        """
+        Set callback for ASK permission prompts.
+
+        This callback is invoked when a tool/skill requires user confirmation
+        before execution (ASK permission level).
+
+        Args:
+            callback: Async function(tool_category, tool_name, context) -> bool
+                      Returns True if user approves, False otherwise
+        """
+        self._permission_callback = callback
+        # Forward to permission manager if it exists
+        if self.permission_manager:
+            self.permission_manager.set_permission_callback(callback)
+        logger.debug(f"Permission callback set for node '{self.get_node_name()}'")
+
+    def _get_available_skills_context(self) -> str:
+        """
+        Generate <available_skills> XML context for system prompt injection.
+
+        Returns the XML block listing skills the LLM can use via load_skill tool.
+        Skills with DENY permission are filtered out.
+
+        Returns:
+            XML string for system prompt injection, empty string if no skills
+        """
+        if not self.skill_manager:
+            return ""
+
+        # Get skill patterns from node config (e.g., "sql-*, data-*")
+        skill_patterns_str = self.node_config.get("skills", "")
+        skill_patterns = None
+        if skill_patterns_str:
+            skill_patterns = self.skill_manager.parse_skill_patterns(skill_patterns_str)
+
+        return self.skill_manager.generate_available_skills_xml(
+            node_name=self.get_node_name(),
+            patterns=skill_patterns,
+        )
+
+    def _get_tool_category(self, tool_name: str) -> str:
+        """
+        Determine tool category from tool name for permission checking.
+
+        Args:
+            tool_name: Name of the tool
+
+        Returns:
+            Tool category string: "db_tools", "mcp", "skills", or "tools"
+        """
+        # Check for skill-related tools
+        if tool_name == "load_skill" or tool_name.startswith("skill_"):
+            return "skills"
+
+        # Check for database tools
+        if tool_name.startswith("db_") or tool_name in [
+            "list_tables",
+            "describe_table",
+            "execute_sql",
+            "get_sample_data",
+        ]:
+            return "db_tools"
+
+        # Check for MCP tools (usually have mcp_ prefix or are in mcp_servers)
+        mcp_tool_names = set()
+        for server_name in self.mcp_servers.keys():
+            mcp_tool_names.add(f"{server_name}_")
+        for mcp_prefix in mcp_tool_names:
+            if tool_name.startswith(mcp_prefix):
+                return "mcp"
+
+        # Default to generic tools category
+        return "tools"
 
     def setup_input(self, workflow: "Workflow") -> Dict:
         """
@@ -572,24 +809,76 @@ class AgenticNode(Node):
             ActionHistory: Progress updates during execution
         """
 
+    def _get_or_create_broker(self) -> "InteractionBroker":
+        """
+        Get or create the interaction broker for this node.
+
+        Resets the broker's asyncio.Queue so it binds to the current event loop.
+        This is necessary because each asyncio.run() creates a new event loop,
+        and asyncio.Queue is bound at creation time. Without this reset, reusing
+        a node across multiple asyncio.run() calls would fail with
+        'Queue is bound to a different event loop'.
+
+        Returns:
+            InteractionBroker instance for this node
+        """
+        self.interaction_broker.reset_queue()
+        return self.interaction_broker
+
+    async def execute_stream_with_interactions(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """
+        Execute with interaction support, merging execute_stream with broker.
+
+        This is the method that UI components should call instead of execute_stream()
+        when they want to handle interactions from hooks.
+
+        Supports graceful interruption via self.interrupt_controller. When interrupted,
+        yields an "interrupted" action and stops execution cleanly.
+
+        Args:
+            action_history_manager: Optional action history manager for tracking
+
+        Yields:
+            ActionHistory: Progress updates during execution, including INTERACTION actions
+        """
+        from datus.cli.execution_state import merge_interaction_stream
+
+        self.interrupt_controller.reset()
+        broker = self._get_or_create_broker()
+
+        action_stream = self.execute_stream(action_history_manager)
+        try:
+            async for action in merge_interaction_stream(action_stream, broker):
+                self.interrupt_controller.check()
+                yield action
+        except ExecutionInterrupted:
+            logger.info("Execution interrupted by user")
+            yield ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type="interrupted",
+                messages="Execution interrupted. You can continue with additional information.",
+                input_data={},
+                status=ActionStatus.SUCCESS,
+            )
+
     def clear_session(self) -> None:
-        """Clear the current session and reset token count."""
+        """Clear the current session."""
         if self.model and self.session_id:
             self.model.clear_session(self.session_id)
             self._session = None
-            self._session_tokens = 0  # Reset token count
-            logger.info(f"Cleared session: {self.session_id}, tokens reset to 0")
+            logger.info(f"Cleared session: {self.session_id}")
 
     def delete_session(self) -> None:
-        """Delete the current session completely and reset token count."""
+        """Delete the current session completely."""
         if self.model and self.session_id:
             self.model.delete_session(self.session_id)
             self._session = None
             self.session_id = None
-            self._session_tokens = 0  # Reset token count
-            logger.info("Deleted session, tokens reset to 0")
+            logger.info("Deleted session")
 
-    def get_session_info(self) -> Dict[str, Any]:
+    async def get_session_info(self) -> Dict[str, Any]:
         """
         Get information about the current session.
 
@@ -599,7 +888,7 @@ class AgenticNode(Node):
         if not self.session_id:
             return {"session_id": None, "active": False}
 
-        current_tokens = self._count_session_tokens()
+        current_tokens = await self._count_session_tokens()
 
         return {
             "session_id": self.session_id,

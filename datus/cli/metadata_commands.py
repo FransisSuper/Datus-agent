@@ -14,6 +14,7 @@ from rich.box import SIMPLE_HEAD
 from rich.panel import Panel
 from rich.table import Table
 
+from datus.tools.db_tools.registry import connector_registry
 from datus.utils.constants import DBType
 from datus.utils.loggings import get_logger
 
@@ -60,9 +61,9 @@ class MetadataCommands:
                     is_current = db_config.logic_name == self.cli.cli_context.current_logic_db_name
                     result.append(
                         {
-                            "logic_name": db_config.logic_name
-                            if not is_current
-                            else f"[bold green]{db_config.logic_name}[/]",
+                            "logic_name": (
+                                db_config.logic_name if not is_current else f"[bold green]{db_config.logic_name}[/]"
+                            ),
                             "name": db_config.database,
                             "uri": db_config.uri,
                         }
@@ -73,9 +74,11 @@ class MetadataCommands:
                     ):
                         result.append(
                             {
-                                "name": db_name
-                                if db_name != self.cli.cli_context.current_db_name
-                                else f"[bold green]{db_name}[/]"
+                                "name": (
+                                    db_name
+                                    if db_name != self.cli.cli_context.current_db_name
+                                    else f"[bold green]{db_name}[/]"
+                                )
                             }
                         )
 
@@ -188,7 +191,7 @@ class MetadataCommands:
     def cmd_schemas(self, args: str):
         """List all schemas in the current database."""
         dialect = self.cli.db_connector.dialect
-        if not DBType.support_schema(dialect):
+        if not connector_registry.support_schema(dialect):
             self.cli.console.print(f"[bold red]The {dialect} database does not support schema[/]")
             return
         result = self.cli.db_connector.get_schemas(
@@ -221,7 +224,7 @@ class MetadataCommands:
     def cmd_switch_schema(self, args: str):
         """Switch current schema."""
         dialect = self.cli.db_connector.dialect
-        if not DBType.support_schema(dialect):
+        if not connector_registry.support_schema(dialect):
             self.cli.console.print(f"[bold red]The {dialect} database does not support schema[/]")
             return
         schema_name = args.strip()

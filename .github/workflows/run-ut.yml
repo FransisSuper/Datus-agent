@@ -1,6 +1,16 @@
 name: unit test
 on:
+  workflow_dispatch:
+    inputs:
+      force-rebuild-kb:
+        description: 'Force rebuild knowledge base data'
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      force-rebuild-kb:
+        type: boolean
+        default: false
     outputs:
       build-artifact:
         description: "Built artifact path"
@@ -20,9 +30,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip install -r requirements-test.txt
+          pip install --upgrade --no-cache-dir datus-semantic-metricflow
 
       - name: Setup config file
         run: |
@@ -38,6 +58,8 @@ jobs:
             if [[ ! -z "$line" && ! "$line" =~ ^[[:space:]]*# ]]; then
               # Remove any surrounding whitespace and export to GITHUB_ENV
               var_name=$(echo "$line" | cut -d'=' -f1)
+              var_value=$(echo "$line" | cut -d'=' -f2-)
+              echo "::add-mask::$var_value"
               echo "Loading variable: $var_name"
               echo "$line" >> $GITHUB_ENV
             fi
@@ -49,13 +71,30 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Cache knowledge base data
+        id: kb-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/data/datus_db_bird_school
+            tests/data/datus_db_bird_sqlite
+            tests/data/datus_db_ssb_sqlite
+          key: ${{ runner.os }}-kb-${{ hashFiles('build_scripts/build_test_data.sh', 'tests/conf/agent.yml', 'sample_data/**', 'datus/storage/schema_metadata/**', 'datus/storage/reference_sql/**', 'datus/storage/ext_knowledge/**', 'datus/storage/metric/**', 'datus/storage/semantic_model/**', 'datus/storage/subject_tree/**', 'datus/storage/base.py', 'datus/storage/embedding_models.py', 'datus/storage/fastembed_embeddings.py', 'datus/agent/node/sql_summary_agentic_node.py', 'datus/agent/node/gen_ext_knowledge_agentic_node.py', 'datus/agent/node/gen_metrics_agentic_node.py', 'datus/agent/node/gen_semantic_model_agentic_node.py', 'datus/prompts/prompt_templates/*.j2') }}
+          restore-keys: |
+            ${{ runner.os }}-kb-
+
       - name: Build test data
+        if: steps.kb-cache.outputs.cache-hit != 'true' || inputs.force-rebuild-kb == true
         run: |
           echo "Building test data before running pytest..."
           chmod +x build_scripts/build_test_data.sh
           ./build_scripts/build_test_data.sh || exit 1
           echo "Test data build completed"
 
-      - name: run pytest
+      - name: run acceptance tests
         run: |
-          python -m pytest -m acceptance  tests/
+          python -m pytest -m acceptance tests/
+
+      - name: run regression tests (single model)
+        run: |
+          python -m pytest -m regression --single-model tests/regression/test_regression_llm.py
