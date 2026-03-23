@@ -1,21 +1,21 @@
 agent:
-  #target: gemini
-  #models:
-  #  gemini:
-  #    type: gemini
-  #    vendor: google
-  #    base_url: https://generativelanguage.googleapis.com/v1beta
-  #    api_key: AIzaSyCUcSgbTU5q8thkKt54qXNhovRl1dIyt7I
-  #    model: gemini-2.0-flash
-
-  target: openai
+  target: gemini
   models:
-    openai:
-      type: openai
-      vendor: openai
-      base_url: https://api.openai-hk.com/v1
-      api_key: hk-sfl0rj1000055004c814a7ad2027cb6ca177b59fa736ca31
-      model: gpt-4o
+    gemini:
+      type: gemini
+      vendor: google
+      base_url: https://generativelanguage.googleapis.com/v1beta
+      api_key: AIzaSyA3hnMk-xxxxxxxx-xxxxxxxx
+      model: gemini-3.1-pro-preview
+
+  #target: openai
+  #models:
+  #  openai:
+  #    type: openai
+  #    vendor: openai
+  #    base_url: https://api.openai-hk.com/v1
+  #    api_key: hk-sfl0rj100005500
+  #    model: gpt-4o
 
   # local databases configuration
   namespace:
