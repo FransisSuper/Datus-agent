@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "demo_lineage_metadata": {
+      "type": "http",
+      "tool_filter": {
+        "allowed_tool_names": [
+          "search_metadata",
+          "get_metadata",
+          "get_lineage"
+        ],
+        "enabled": true
+      },
+      "url": "http://127.0.0.1:18082/mcp",
+      "timeout": 10.0
+    }
+  }
+}

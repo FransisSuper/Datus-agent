@@ -11,8 +11,12 @@ and status monitoring.
 """
 
 import asyncio
+import ipaddress
 import json
 import threading
+from urllib.parse import urlparse
+
+import httpx
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents import Agent, RunContextWrapper, Usage
@@ -31,6 +35,38 @@ from datus.tools.mcp_tools.mcp_server import SilentMCPServerStdio
 from datus.utils.loggings import get_logger
 
 logger = get_logger(__name__)
+
+
+def _should_bypass_env_proxy(url: str) -> bool:
+    """Return True when the target is a local loopback address."""
+    hostname = urlparse(url).hostname
+    if not hostname:
+        return False
+
+    if hostname == "localhost":
+        return True
+
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _create_local_httpx_client(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+    """Create an httpx client that ignores environment proxy settings."""
+    kwargs = {
+        "follow_redirects": True,
+        "trust_env": False,
+    }
+
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if headers is not None:
+        kwargs["headers"] = headers
+    if auth is not None:
+        kwargs["auth"] = auth
+
+    return httpx.AsyncClient(**kwargs)
 
 
 def create_static_tool_filter(
@@ -427,15 +463,24 @@ class MCPManager:
         # Merge default headers with user-provided headers
         merged_headers = {"Accept": "application/json, text/event-stream", **headers}
 
-        server_params = MCPServerStreamableHttpParams(
-            url=url,
-            headers=merged_headers,
-            timeout=timeout,
-            sse_read_timeout=timeout,
-            terminate_on_close=True,
-        )
+        server_params_data = {
+            "url": url,
+            "headers": merged_headers,
+            "timeout": timeout,
+            "sse_read_timeout": timeout,
+            "terminate_on_close": True,
+        }
+        if _should_bypass_env_proxy(url):
+            server_params_data["httpx_client_factory"] = _create_local_httpx_client
+
+        server_params = MCPServerStreamableHttpParams(**server_params_data)
         server_instance = MCPServerStreamableHttp(params=server_params, client_session_timeout_seconds=60)
-        details = {"url": url, "headers_count": len(merged_headers), "timeout": timeout}
+        details = {
+            "url": url,
+            "headers_count": len(merged_headers),
+            "timeout": timeout,
+            "bypass_env_proxy": _should_bypass_env_proxy(url),
+        }
         return server_instance, details
 
     async def _run_tools_operation_async(

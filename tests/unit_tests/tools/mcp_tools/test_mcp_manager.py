@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from datus.tools.mcp_tools.mcp_config import MCPServerType, SSEServerConfig, STDIOServerConfig, ToolFilterConfig
-from datus.tools.mcp_tools.mcp_manager import MCPManager, _validate_server_exists, create_static_tool_filter
+from datus.tools.mcp_tools.mcp_manager import (
+    MCPManager,
+    _should_bypass_env_proxy,
+    _validate_server_exists,
+    create_static_tool_filter,
+)
 
 # ---------------------------------------------------------------------------
 # Helper: build a manager bypassing __init__ path manager calls
@@ -55,6 +60,17 @@ class TestCreateStaticToolFilter:
     def test_filter_is_toolfilterconfig(self):
         tf = create_static_tool_filter()
         assert isinstance(tf, ToolFilterConfig)
+
+
+class TestLocalProxyBypass:
+    def test_localhost_bypasses_proxy(self):
+        assert _should_bypass_env_proxy("http://localhost:18082/mcp") is True
+
+    def test_loopback_ip_bypasses_proxy(self):
+        assert _should_bypass_env_proxy("http://127.0.0.1:18082/mcp") is True
+
+    def test_remote_host_does_not_bypass_proxy(self):
+        assert _should_bypass_env_proxy("https://api.example.com/mcp") is False
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +294,21 @@ class TestCreateServerInstance:
         with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttp") as mock_cls:
             mock_instance = MagicMock()
             mock_cls.return_value = mock_instance
-            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttpParams"):
+            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttpParams") as mock_params:
                 instance, details = manager._create_http_server({"url": "http://example.com"})
         assert instance is not None
+        assert "httpx_client_factory" not in mock_params.call_args.kwargs
+
+    def test_create_http_server_loopback_disables_env_proxy(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttp") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttpParams") as mock_params:
+                instance, details = manager._create_http_server({"url": "http://127.0.0.1:18082/mcp"})
+        assert instance is not None
+        assert mock_params.call_args.kwargs["httpx_client_factory"] is not None
+        assert details["bypass_env_proxy"] is True
 
     def test_create_server_instance_unsupported_type(self, tmp_path):
         manager = _make_manager(tmp_path)

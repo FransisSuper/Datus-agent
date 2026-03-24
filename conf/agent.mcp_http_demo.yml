@@ -1,0 +1,31 @@
+agent:
+  home: ./.datus-demo
+  target: demo-model
+
+  models:
+    demo-model:
+      type: openai
+      vendor: openai
+      base_url: https://api.openai-hk.com/v1
+      api_key: hk-sfl0rj1000055004c814a7ad2027cb6ca177b59fa736ca31
+      model: gpt-4o
+
+  storage:
+    workspace_root: ./.datus-demo/workspace
+    embedding_device_type: cpu
+
+  namespace:
+    local_duckdb:
+      type: duckdb
+      name: duckdb-demo
+      uri: ./sample_data/duckdb-demo.duckdb
+
+  agentic_nodes:
+    chat:
+      model: demo-model
+      tools: db_tools.*, context_search_tools.*, date_parsing_tools.*
+      mcp: demo_lineage_metadata
+      max_turns: 20
+      rules:
+        - For metadata and lineage questions, use MCP tools before answering.
+        - Prefer get_metadata and get_lineage for specific objects.

@@ -141,6 +141,14 @@ class TestParseCommandString:
         assert "arg2" in params["args"]
         assert "KEY" in params["env"]
 
+    def test_stdio_args_can_include_transport_flag(self):
+        cmd = "--transport stdio demo python scripts/mock_lineage_metadata_mcp.py --transport stdio"
+        t, name, params = parse_command_string(cmd)
+        assert t == "stdio"
+        assert name == "demo"
+        assert params["command"] == "python"
+        assert params["args"] == ["scripts/mock_lineage_metadata_mcp.py", "--transport", "stdio"]
+
     def test_stdio_no_name(self):
         # Only one token after --transport (the transport type itself)
         cmd = "--transport stdio python"
