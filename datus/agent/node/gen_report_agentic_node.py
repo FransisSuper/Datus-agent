@@ -20,6 +20,7 @@ from datus.schemas.gen_report_agentic_node_models import GenReportNodeInput, Gen
 from datus.tools.db_tools.db_manager import db_manager_instance
 from datus.tools.func_tool import ContextSearchTools, DBFuncTool
 from datus.tools.func_tool.semantic_tools import SemanticTools
+from datus.tools.mcp_tools import MCPServer
 from datus.utils.loggings import get_logger
 from datus.utils.message_utils import MessagePart, build_structured_content
 
@@ -93,8 +94,11 @@ class GenReportAgenticNode(AgenticNode):
             input_data=input_data,
             agent_config=agent_config,
             tools=tools or [],
-            mcp_servers={},  # No MCP servers for report nodes by default
+            mcp_servers={},  # Initialize empty, will setup after parent init
         )
+
+        # Initialize MCP servers based on configuration (after node_config is available)
+        self.mcp_servers = self._setup_mcp_servers()
 
         # Setup tools based on configuration
         self.setup_tools()
@@ -265,6 +269,83 @@ class GenReportAgenticNode(AgenticNode):
         except Exception as e:
             logger.error(f"Failed to setup {tool_type}.{method_name}: {e}")
 
+    # ── MCP Servers ─────────────────────────────────────────────────────
+
+    def _setup_mcp_servers(self) -> Dict[str, Any]:
+        """Set up MCP servers based on configuration."""
+        mcp_servers = {}
+
+        config_value = self.node_config.get("mcp", "")
+        if not config_value:
+            return mcp_servers
+
+        mcp_server_names = [p.strip() for p in config_value.split(",") if p.strip()]
+
+        for server_name in mcp_server_names:
+            try:
+                if server_name == "metricflow_mcp":
+                    server = self._setup_metricflow_mcp()
+                    if server:
+                        mcp_servers["metricflow_mcp"] = server
+                        logger.info(
+                            f"Setup metricflow_mcp MCP server for database: {self.agent_config.current_database}"
+                        )
+                    continue
+
+                server = self._setup_mcp_server_from_config(server_name)
+                if server:
+                    mcp_servers[server_name] = server
+
+            except Exception as e:
+                logger.error(f"Failed to setup MCP server '{server_name}': {e}")
+
+        logger.debug(f"Setup {len(mcp_servers)} MCP servers for report node: {list(mcp_servers.keys())}")
+        return mcp_servers
+
+    def _setup_metricflow_mcp(self) -> Optional[Any]:
+        """Setup MetricFlow MCP server."""
+        try:
+            if not self.agent_config:
+                return None
+
+            db_config = self.agent_config.current_db_config()
+            if not db_config:
+                return None
+
+            metricflow_server = MCPServer.get_metricflow_mcp_server(namespace=self.agent_config.current_namespace)
+            if metricflow_server:
+                logger.info(f"Added metricflow_mcp MCP server for database: {db_config.database}")
+                return metricflow_server
+        except Exception as e:
+            logger.error(f"Failed to setup metricflow_mcp: {e}")
+        return None
+
+    def _setup_mcp_server_from_config(self, server_name: str) -> Optional[Any]:
+        """Setup MCP server from {agent.home}/conf/.mcp.json using mcp_manager."""
+        try:
+            from datus.tools.mcp_tools.mcp_manager import MCPManager
+
+            mcp_manager = MCPManager()
+            server_config = mcp_manager.get_server_config(server_name)
+
+            if not server_config:
+                logger.warning(f"MCP server '{server_name}' not found in configuration")
+                return None
+
+            server_instance, details = mcp_manager._create_server_instance(server_config)
+
+            if server_instance:
+                logger.debug(f"Added MCP server '{server_name}' from configuration: {details}")
+                return server_instance
+
+            error_msg = details.get("error", "Unknown error")
+            logger.warning(f"Failed to create MCP server '{server_name}': {error_msg}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to setup MCP server '{server_name}' from config: {e}")
+            return None
+
     def _get_system_prompt(
         self,
         conversation_summary: Optional[str] = None,
@@ -283,6 +364,7 @@ class GenReportAgenticNode(AgenticNode):
         context = {
             "has_semantic_tools": bool(self.semantic_tools),
             "has_db_tools": bool(self.db_func_tool),
+            "has_mcp_tools": bool(self.mcp_servers),
             "has_ask_user_tool": self.ask_user_tool is not None,
             "agent_config": self.agent_config,
             "conversation_summary": conversation_summary,

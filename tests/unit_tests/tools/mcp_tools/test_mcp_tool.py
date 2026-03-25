@@ -105,6 +105,17 @@ class TestParseCommandString:
         assert t == "http"
         assert params["url"] == "https://api.example.com/mcp"
 
+    def test_http_with_verify_ssl_and_ca_bundle(self):
+        cmd = (
+            "--transport http my-http https://api.example.com/mcp "
+            "--verify-ssl false --ca-bundle /tmp/custom-ca.pem --use-env-proxy false"
+        )
+        t, name, params = parse_command_string(cmd)
+        assert t == "http"
+        assert params["verify_ssl"] is False
+        assert params["ca_bundle"] == "/tmp/custom-ca.pem"
+        assert params["use_env_proxy"] is False
+
     def test_sse_default_timeout(self):
         cmd = "--transport sse my-sse https://example.com"
         t, name, params = parse_command_string(cmd)

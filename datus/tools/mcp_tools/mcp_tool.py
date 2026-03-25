@@ -455,7 +455,7 @@ def parse_command_string(s: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
 
     Return: (transport_type, name, payload)
     - For 'studio'/'stdio': payload = {"command": str|None, "args": [...], "env": {...}}
-    - For 'sse'/'http':    payload = {"url": str|None, "headers": {...}, "timeout": float}
+    - For 'sse'/'http':    payload = {"url": str|None, "headers": {...}, "timeout": float, "verify_ssl": bool|None, "ca_bundle": str|None}
     Comments are in English as requested.
     """
     tokens = shlex.split(s)
@@ -482,6 +482,21 @@ def parse_command_string(s: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
                 timeout = float(tokens[i + 1])
             except Exception:
                 timeout = None
+
+    verify_ssl: Optional[bool] = None
+    for i, t in enumerate(tokens):
+        if t == "--verify-ssl" and i + 1 < n:
+            verify_ssl = tokens[i + 1].lower() in ("true", "1", "yes", "on")
+
+    ca_bundle: Optional[str] = None
+    for i, t in enumerate(tokens):
+        if t == "--ca-bundle" and i + 1 < n:
+            ca_bundle = tokens[i + 1]
+
+    use_env_proxy: Optional[bool] = None
+    for i, t in enumerate(tokens):
+        if t == "--use-env-proxy" and i + 1 < n:
+            use_env_proxy = tokens[i + 1].lower() in ("true", "1", "yes", "on")
 
     if not transport_seg:
         raise DatusException(ErrorCode.COMMON_FIELD_INVALID, message="No --transport found.")
@@ -571,7 +586,14 @@ def parse_command_string(s: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
         if timeout is None:
             timeout = 10.0
 
-        return transport_type, name, {"url": url, "headers": header or {}, "timeout": timeout}
+        payload = {"url": url, "headers": header or {}, "timeout": timeout}
+        if verify_ssl is not None:
+            payload["verify_ssl"] = verify_ssl
+        if ca_bundle:
+            payload["ca_bundle"] = ca_bundle
+        if use_env_proxy is not None:
+            payload["use_env_proxy"] = use_env_proxy
+        return transport_type, name, payload
     raise DatusException(
         ErrorCode.COMMON_FIELD_INVALID, message=f"Unsupported transport protocols: {transport_type}, full_params: {s}"
     )

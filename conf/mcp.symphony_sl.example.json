@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "symphony-sl": {
+      "type": "http",
+      "url": "https://kong-symphony-dev.bmwbrill.cn/symphony-mcp-sl/mcp",
+      "headers": {
+        "symphony-mcp-sl-apikey": "${SYMPHONY_MCP_SL_APIKEY}"
+      },
+      "timeout": 30.0,
+      "verify_ssl": false,
+      "use_env_proxy": false
+    }
+  }
+}

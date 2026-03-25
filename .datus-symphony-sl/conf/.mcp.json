@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "symphony-sl": {
+      "type": "http",
+      "tool_filter": {
+        "allowed_tool_names": [
+          "sl.table_impact_report",
+          "sl.table_lineage_report",
+          "sl.column_lineage_report",
+          "sl.column_impact_report",
+          "sl.search_lineage_tables",
+          "sl.search_lineage_columns",
+          "sl.search_metadata_tables",
+          "sl"
+        ],
+        "enabled": true
+      },
+      "url": "https://kong-symphony-dev.bmwbrill.cn/symphony-mcp-sl/mcp",
+      "headers": {
+        "symphony-mcp-sl-apikey": "d819472fa68747f99d6f49764e7f901d"
+      },
+      "timeout": 10.0,
+      "verify_ssl": false,
+      "use_env_proxy": false
+    }
+  }
+}

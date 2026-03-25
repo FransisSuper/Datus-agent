@@ -238,6 +238,19 @@ class TestHTTPServerConfig:
         info = cfg.get_connection_info()
         assert info["headers"] == {}
 
+    def test_verify_ssl_and_ca_bundle_fields(self):
+        cfg = HTTPServerConfig(
+            name="s",
+            url="https://example.com",
+            verify_ssl=False,
+            ca_bundle="/tmp/custom-ca.pem",
+            use_env_proxy=False,
+        )
+        info = cfg.get_connection_info()
+        assert info["verify_ssl"] is False
+        assert info["ca_bundle"] == "/tmp/custom-ca.pem"
+        assert info["use_env_proxy"] is False
+
 
 # ---------------------------------------------------------------------------
 # MCPServerConfig.from_config_format factory
@@ -257,9 +270,21 @@ class TestMCPServerConfigFactory:
         assert cfg.url == "http://example.com/sse"
 
     def test_create_http_from_dict(self):
-        cfg = MCPServerConfig.from_config_format("srv", {"type": "http", "url": "http://example.com/mcp"})
+        cfg = MCPServerConfig.from_config_format(
+            "srv",
+            {
+                "type": "http",
+                "url": "http://example.com/mcp",
+                "verify_ssl": False,
+                "ca_bundle": "/tmp/custom-ca.pem",
+                "use_env_proxy": False,
+            },
+        )
         assert isinstance(cfg, HTTPServerConfig)
         assert cfg.url == "http://example.com/mcp"
+        assert cfg.verify_ssl is False
+        assert cfg.ca_bundle == "/tmp/custom-ca.pem"
+        assert cfg.use_env_proxy is False
 
     def test_defaults_to_stdio_when_no_type(self):
         cfg = MCPServerConfig.from_config_format("srv", {"command": "echo"})

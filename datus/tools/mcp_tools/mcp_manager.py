@@ -14,6 +14,7 @@ import asyncio
 import ipaddress
 import json
 import threading
+from functools import partial
 from urllib.parse import urlparse
 
 import httpx
@@ -52,11 +53,19 @@ def _should_bypass_env_proxy(url: str) -> bool:
         return False
 
 
-def _create_local_httpx_client(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
-    """Create an httpx client that ignores environment proxy settings."""
+def _create_httpx_client(
+    headers=None,
+    timeout=None,
+    auth=None,
+    *,
+    trust_env: bool = True,
+    verify: Any = True,
+) -> httpx.AsyncClient:
+    """Create an httpx client with configurable proxy and TLS verification behavior."""
     kwargs = {
         "follow_redirects": True,
-        "trust_env": False,
+        "trust_env": trust_env,
+        "verify": verify,
     }
 
     if timeout is not None:
@@ -470,8 +479,22 @@ class MCPManager:
             "sse_read_timeout": timeout,
             "terminate_on_close": True,
         }
-        if _should_bypass_env_proxy(url):
-            server_params_data["httpx_client_factory"] = _create_local_httpx_client
+        use_env_proxy = expanded_config.get("use_env_proxy")
+        trust_env = bool(use_env_proxy) if use_env_proxy is not None else not _should_bypass_env_proxy(url)
+        verify_ssl = expanded_config.get("verify_ssl")
+        ca_bundle = expanded_config.get("ca_bundle")
+        verify: Any = True
+        if ca_bundle:
+            verify = ca_bundle
+        elif verify_ssl is False:
+            verify = False
+
+        if verify is not True or trust_env is False:
+            server_params_data["httpx_client_factory"] = partial(
+                _create_httpx_client,
+                trust_env=trust_env,
+                verify=verify,
+            )
 
         server_params = MCPServerStreamableHttpParams(**server_params_data)
         server_instance = MCPServerStreamableHttp(params=server_params, client_session_timeout_seconds=60)
@@ -480,6 +503,9 @@ class MCPManager:
             "headers_count": len(merged_headers),
             "timeout": timeout,
             "bypass_env_proxy": _should_bypass_env_proxy(url),
+            "verify_ssl": verify_ssl if verify_ssl is not None else True,
+            "ca_bundle": ca_bundle,
+            "use_env_proxy": use_env_proxy,
         }
         return server_instance, details
 

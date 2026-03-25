@@ -274,6 +274,28 @@ class TestCreateServerInstance:
         assert instance is None
         assert "error" in details
 
+    def test_create_http_server_with_custom_tls_factory(self, tmp_path):
+        from datus.tools.mcp_tools.mcp_config import HTTPServerConfig
+
+        manager = _make_manager(tmp_path)
+        cfg = HTTPServerConfig(
+            name="http",
+            url="https://example.com/mcp",
+            verify_ssl=False,
+            ca_bundle="/tmp/custom-ca.pem",
+            use_env_proxy=False,
+        )
+        with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttp") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttpParams") as mock_params_cls:
+                mock_params_cls.side_effect = lambda **kwargs: kwargs
+                instance, details = manager._create_server_instance(cfg)
+        assert instance is mock_instance
+        assert details["verify_ssl"] is False
+        assert details["ca_bundle"] == "/tmp/custom-ca.pem"
+        assert details["use_env_proxy"] is False
+
     def test_create_http_server_missing_url(self, tmp_path):
         manager = _make_manager(tmp_path)
         instance, details = manager._create_http_server({"url": None})

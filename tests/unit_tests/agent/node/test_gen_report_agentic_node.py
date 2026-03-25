@@ -203,6 +203,40 @@ class TestGenReportAgenticNodeExecutionMode:
 
 
 # ---------------------------------------------------------------------------
+# MCP Setup Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenReportAgenticNodeMcpSetup:
+    def test_empty_mcp_config_returns_empty(self, real_agent_config, mock_llm_create):
+        node = _make_node(real_agent_config, mock_llm_create)
+        node.node_config = {"mcp": ""}
+        result = node._setup_mcp_servers()
+        assert result == {}
+
+    def test_custom_mcp_server_from_config(self, real_agent_config, mock_llm_create):
+        node = _make_node(real_agent_config, mock_llm_create)
+        node.node_config = {"mcp": "symphony-sl"}
+
+        mock_server = object()
+        with patch.object(node, "_setup_mcp_server_from_config", return_value=mock_server) as mock_from_config:
+            result = node._setup_mcp_servers()
+
+        mock_from_config.assert_called_once_with("symphony-sl")
+        assert result == {"symphony-sl": mock_server}
+
+    def test_metricflow_mcp_setup(self, real_agent_config, mock_llm_create):
+        node = _make_node(real_agent_config, mock_llm_create)
+        node.node_config = {"mcp": "metricflow_mcp"}
+
+        mock_server = object()
+        with patch.object(node, "_setup_metricflow_mcp", return_value=mock_server):
+            result = node._setup_mcp_servers()
+
+        assert result == {"metricflow_mcp": mock_server}
+
+
+# ---------------------------------------------------------------------------
 # Execution Tests
 # ---------------------------------------------------------------------------
 

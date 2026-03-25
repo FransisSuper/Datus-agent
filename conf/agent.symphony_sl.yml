@@ -1,0 +1,61 @@
+agent:
+  home: ./.datus-symphony-sl
+  target: governance-model
+
+  models:
+    governance-model:
+      type: openai
+      vendor: openai
+      base_url: https://api.openai-hk.com/v1
+      api_key: hk-sfl0rj1000055004c814a7ad2027cb6ca177b59fa736ca31
+      model: gpt-4o
+
+  storage:
+    workspace_root: ./.datus-symphony-sl/workspace
+    embedding_device_type: cpu
+
+  namespace:
+    local_duckdb:
+      type: duckdb
+      name: duckdb-demo
+      uri: ./sample_data/duckdb-demo.duckdb
+
+  agentic_nodes:
+    chat:
+      model: governance-model
+      tools: db_tools.*, context_search_tools.*, date_parsing_tools.*
+      mcp: symphony-sl
+      max_turns: 20
+      rules:
+        - For table discovery or fuzzy table lookup, call sl.search_metadata_tables first.
+        - For column discovery or fuzzy column lookup, call sl.search_metadata_columns first.
+        - For a known table and its columns, call sl.list_table_columns before answering field-level questions.
+        - For table lineage questions, call sl.table_lineage_report.
+        - For table impact questions, call sl.table_impact_report.
+        - For column lineage questions, call sl.column_lineage_report.
+        - For column impact questions, call sl.column_impact_report.
+        - Use sl.search_lineage_tables or sl.search_lineage_columns only when the user asks a lineage question but the exact object name is still unclear.
+        - If the user asks for owner, steward, or description and the MCP result does not explicitly return it, say it is unavailable instead of guessing.
+        - Do not fabricate fields, lineage hops, or impact scope that are not returned by MCP tools.
+
+    data_governance:
+      node_class: gen_report
+      model: governance-model
+      system_prompt: gen_report
+      prompt_version: "1.0"
+      tools: ""
+      mcp: symphony-sl
+      max_turns: 12
+      agent_description: "A governance copilot for metadata, lineage, ownership, and impact analysis."
+      rules:
+        - For fuzzy table lookup, call sl.search_metadata_tables and shortlist the top relevant candidates before deeper analysis.
+        - For fuzzy column lookup, call sl.search_metadata_columns and shortlist the top relevant candidates before deeper analysis.
+        - For a confirmed table, call sl.list_table_columns to enumerate columns before any column-level conclusion.
+        - For table lineage analysis, call sl.table_lineage_report and summarize upstream and downstream separately.
+        - For table impact analysis, call sl.table_impact_report and explicitly distinguish direct impact from broader downstream references if the tool output distinguishes them.
+        - For column lineage analysis, call sl.column_lineage_report.
+        - For column impact analysis, call sl.column_impact_report.
+        - When a lineage question starts without an exact object identifier, use sl.search_lineage_tables or sl.search_lineage_columns first, then ask the user to confirm only if multiple candidates remain ambiguous.
+        - If owner, steward, description, classification, or other metadata fields are not explicitly present in tool output, mark them as unavailable instead of inferring them.
+        - In the final report, separate Findings, Lineage, and Impact sections, and only include claims supported by MCP output.
+        - Stop after the relevant governance tools succeed; do not switch to unrelated DB or context tools unless the user explicitly asks for local data validation.

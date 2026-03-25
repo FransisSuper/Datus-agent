@@ -205,6 +205,9 @@ class MCPServerConfig(BaseModel):
                 url=expanded_config.get("url"),
                 headers=expanded_config.get("headers"),
                 timeout=expanded_config.get("timeout"),
+                verify_ssl=expanded_config.get("verify_ssl"),
+                ca_bundle=expanded_config.get("ca_bundle"),
+                use_env_proxy=expanded_config.get("use_env_proxy"),
                 tool_filter=tool_filter,
             )
         elif server_type == MCPServerType.HTTP:
@@ -213,6 +216,9 @@ class MCPServerConfig(BaseModel):
                 url=expanded_config.get("url"),
                 headers=expanded_config.get("headers"),
                 timeout=expanded_config.get("timeout"),
+                verify_ssl=expanded_config.get("verify_ssl"),
+                ca_bundle=expanded_config.get("ca_bundle"),
+                use_env_proxy=expanded_config.get("use_env_proxy"),
                 tool_filter=tool_filter,
             )
         else:
@@ -244,6 +250,11 @@ class SSEServerConfig(MCPServerConfig):
     url: str = Field(..., description="Server URL")
     headers: Optional[Dict[str, str]] = Field(None, description="HTTP headers")
     timeout: Optional[float] = Field(None, description="Connection timeout")
+    verify_ssl: Optional[bool] = Field(default=None, description="Whether to verify TLS certificates")
+    ca_bundle: Optional[str] = Field(default=None, description="Path to custom CA bundle")
+    use_env_proxy: Optional[bool] = Field(
+        default=None, description="Whether to respect environment proxy variables"
+    )
 
     @field_validator("timeout")
     @classmethod
@@ -260,6 +271,9 @@ class SSEServerConfig(MCPServerConfig):
             "url": self.url,
             "headers": self.headers or {},
             "timeout": self.timeout,
+            "verify_ssl": self.verify_ssl,
+            "ca_bundle": self.ca_bundle,
+            "use_env_proxy": self.use_env_proxy,
         }
 
 
@@ -270,6 +284,11 @@ class HTTPServerConfig(MCPServerConfig):
     url: str = Field(..., description="Server URL")
     headers: Optional[Dict[str, str]] = Field(None, description="HTTP headers")
     timeout: Optional[float] = Field(None, description="Connection timeout")
+    verify_ssl: Optional[bool] = Field(default=None, description="Whether to verify TLS certificates")
+    ca_bundle: Optional[str] = Field(default=None, description="Path to custom CA bundle")
+    use_env_proxy: Optional[bool] = Field(
+        default=None, description="Whether to respect environment proxy variables"
+    )
 
     @field_validator("timeout")
     @classmethod
@@ -286,6 +305,9 @@ class HTTPServerConfig(MCPServerConfig):
             "url": self.url,
             "headers": self.headers or {},
             "timeout": self.timeout,
+            "verify_ssl": self.verify_ssl,
+            "ca_bundle": self.ca_bundle,
+            "use_env_proxy": self.use_env_proxy,
         }
 
 
@@ -376,6 +398,12 @@ class MCPConfig(BaseModel):
                     server_config["headers"] = server.headers
                 if server.timeout:
                     server_config["timeout"] = server.timeout
+                if server.verify_ssl is not None:
+                    server_config["verify_ssl"] = server.verify_ssl
+                if server.ca_bundle:
+                    server_config["ca_bundle"] = server.ca_bundle
+                if server.use_env_proxy is not None:
+                    server_config["use_env_proxy"] = server.use_env_proxy
 
             elif server.type == MCPServerType.HTTP:
                 if server.url:
@@ -384,6 +412,12 @@ class MCPConfig(BaseModel):
                     server_config["headers"] = server.headers
                 if server.timeout:
                     server_config["timeout"] = server.timeout
+                if server.verify_ssl is not None:
+                    server_config["verify_ssl"] = server.verify_ssl
+                if server.ca_bundle:
+                    server_config["ca_bundle"] = server.ca_bundle
+                if server.use_env_proxy is not None:
+                    server_config["use_env_proxy"] = server.use_env_proxy
 
             config["mcpServers"][name] = server_config
 
