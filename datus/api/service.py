@@ -4,20 +4,36 @@
 
 import argparse
 import csv
+import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from io import StringIO
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from datus.agent.agent import Agent
+from datus.agent.node.chat_agentic_node import ChatAgenticNode
+from datus.agent.node.gen_ext_knowledge_agentic_node import GenExtKnowledgeAgenticNode
+from datus.agent.node.gen_metrics_agentic_node import GenMetricsAgenticNode
+from datus.agent.node.gen_report_agentic_node import GenReportAgenticNode
+from datus.agent.node.gen_semantic_model_agentic_node import GenSemanticModelAgenticNode
+from datus.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+from datus.agent.node.sql_summary_agentic_node import SqlSummaryAgenticNode
+from datus.cli.autocomplete import AtReferenceCompleter
+from datus.cli.execution_state import auto_submit_interaction
 from datus.configuration.agent_config_loader import load_agent_config
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from datus.schemas.chat_agentic_node_models import ChatNodeInput
+from datus.schemas.ext_knowledge_agentic_node_models import ExtKnowledgeNodeInput
+from datus.schemas.gen_report_agentic_node_models import GenReportNodeInput
+from datus.schemas.gen_sql_agentic_node_models import GenSQLNodeInput
 from datus.schemas.node_models import SqlTask
+from datus.schemas.semantic_agentic_node_models import SemanticNodeInput
+from datus.schemas.sql_summary_agentic_node_models import SqlSummaryNodeInput
 from datus.storage.task import TaskStore
 from datus.utils.loggings import get_logger
 
@@ -28,6 +44,8 @@ from .models import (
     FeedbackResponse,
     HealthResponse,
     Mode,
+    RunChatRequest,
+    RunChatResponse,
     RunWorkflowRequest,
     RunWorkflowResponse,
     TokenResponse,
@@ -47,6 +65,8 @@ class DatusAPIService:
 
     def __init__(self, args: argparse.Namespace):
         self.agents: Dict[str, Agent] = {}
+        self.chat_nodes: Dict[str, Any] = {}
+        self.at_completers: Dict[str, AtReferenceCompleter] = {}
         self.agent_config = None
         self.args = args
         self.task_store = None
@@ -95,6 +115,327 @@ class DatusAPIService:
             logger.info(f"Created new agent for namespace: {namespace}")
 
         return self.agents[namespace]
+
+    def _get_at_completer(self, namespace: str) -> Optional[AtReferenceCompleter]:
+        """Get or create an @-context completer for chat requests."""
+        if not self.agent_config:
+            return None
+
+        if namespace not in self.at_completers:
+            self.agent_config.current_namespace = namespace
+            try:
+                self.at_completers[namespace] = AtReferenceCompleter(self.agent_config)
+            except Exception as e:
+                logger.warning(f"Failed to initialize AtReferenceCompleter for namespace {namespace}: {e}")
+                return None
+
+        return self.at_completers.get(namespace)
+
+    def _parse_chat_context(self, namespace: str, message: str) -> Tuple[List[Any], List[Any], List[Any]]:
+        """Parse @table/@metric/@sql context from a chat message."""
+        completer = self._get_at_completer(namespace)
+        if not completer:
+            return [], [], []
+
+        try:
+            return completer.parse_at_context(message)
+        except Exception as e:
+            logger.warning(f"Failed to parse @-context for namespace {namespace}: {e}")
+            return [], [], []
+
+    def _create_chat_node(self, namespace: str, subagent_name: Optional[str] = None):
+        """Create a chat-capable node using the same routing rules as the CLI."""
+        if not self.agent_config:
+            raise HTTPException(status_code=500, detail="Agent configuration not available")
+
+        self.agent_config.current_namespace = namespace
+
+        if not subagent_name:
+            return ChatAgenticNode(
+                node_id="chat_api",
+                description="Chat node for API interactions",
+                node_type="chat",
+                input_data=None,
+                agent_config=self.agent_config,
+                tools=None,
+            )
+
+        node_config = {}
+        if hasattr(self.agent_config, "agentic_nodes") and self.agent_config.agentic_nodes:
+            node_config = self.agent_config.agentic_nodes.get(subagent_name, {})
+            if hasattr(node_config, "model_dump"):
+                node_config = node_config.model_dump()
+
+        node_class_type = node_config.get("node_class") if isinstance(node_config, dict) else None
+
+        if subagent_name == "gen_semantic_model":
+            return GenSemanticModelAgenticNode(
+                agent_config=self.agent_config,
+                execution_mode="interactive",
+            )
+        if subagent_name == "gen_metrics":
+            return GenMetricsAgenticNode(
+                agent_config=self.agent_config,
+                execution_mode="interactive",
+            )
+        if subagent_name == "gen_sql_summary":
+            return SqlSummaryAgenticNode(
+                node_name=subagent_name,
+                agent_config=self.agent_config,
+                execution_mode="interactive",
+            )
+        if subagent_name == "gen_report" or node_class_type == "gen_report":
+            return GenReportAgenticNode(
+                node_id=f"{subagent_name}_api",
+                description=f"Report generation node for {subagent_name}",
+                node_type="gen_report",
+                input_data=None,
+                agent_config=self.agent_config,
+                tools=None,
+                node_name=subagent_name,
+            )
+        if subagent_name == "gen_ext_knowledge":
+            return GenExtKnowledgeAgenticNode(
+                node_name=subagent_name,
+                agent_config=self.agent_config,
+                execution_mode="interactive",
+            )
+
+        return GenSQLAgenticNode(
+            node_id=f"{subagent_name}_api",
+            description=f"SQL generation node for {subagent_name}",
+            node_type="gensql",
+            input_data=None,
+            agent_config=self.agent_config,
+            tools=None,
+            node_name=subagent_name,
+        )
+
+    def _create_chat_input(self, request: RunChatRequest, node: Any):
+        """Create the correct node input payload for a chat request."""
+        at_tables, at_metrics, at_sqls = self._parse_chat_context(request.namespace, request.message)
+
+        if isinstance(node, (GenSemanticModelAgenticNode, GenMetricsAgenticNode)):
+            return SemanticNodeInput(
+                user_message=request.message,
+                catalog=request.catalog_name,
+                database=request.database_name,
+                db_schema=request.schema_name,
+                prompt_version=None,
+                prompt_language="en",
+            )
+
+        if isinstance(node, SqlSummaryAgenticNode):
+            return SqlSummaryNodeInput(
+                user_message=request.message,
+                catalog=request.catalog_name,
+                database=request.database_name,
+                db_schema=request.schema_name,
+                prompt_version=None,
+                prompt_language="en",
+            )
+
+        if isinstance(node, GenExtKnowledgeAgenticNode):
+            return ExtKnowledgeNodeInput(
+                user_message=request.message,
+                prompt_version=None,
+                prompt_language="en",
+            )
+
+        if isinstance(node, GenSQLAgenticNode):
+            return GenSQLNodeInput(
+                user_message=request.message,
+                catalog=request.catalog_name,
+                database=request.database_name,
+                db_schema=request.schema_name,
+                schemas=at_tables,
+                metrics=at_metrics,
+                reference_sql=at_sqls,
+                prompt_version=None,
+                prompt_language="en",
+                plan_mode=False,
+            )
+
+        if isinstance(node, GenReportAgenticNode):
+            return GenReportNodeInput(
+                user_message=request.message,
+                catalog=request.catalog_name,
+                database=request.database_name,
+                db_schema=request.schema_name,
+                prompt_version=None,
+            )
+
+        return ChatNodeInput(
+            user_message=request.message,
+            catalog=request.catalog_name,
+            database=request.database_name,
+            db_schema=request.schema_name,
+            schemas=at_tables,
+            metrics=at_metrics,
+            reference_sql=at_sqls,
+            plan_mode=False,
+        )
+
+    def _get_or_create_chat_runtime(self, request: RunChatRequest):
+        """Resolve the runtime chat node for a request."""
+        if request.session_id and request.session_id in self.chat_nodes:
+            node = self.chat_nodes[request.session_id]
+            current_name = getattr(node, "get_node_name", lambda: "chat")()
+            expected_name = request.subagent or "chat"
+            if current_name != expected_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Session '{request.session_id}' belongs to node '{current_name}', "
+                        f"but request asked for '{expected_name}'"
+                    ),
+                )
+            return node
+
+        node = self._create_chat_node(request.namespace, request.subagent)
+        if request.session_id:
+            node.session_id = request.session_id
+        return node
+
+    async def _execute_chat_actions(
+        self, request: RunChatRequest
+    ) -> Tuple[List[ActionHistory], Optional[str], Optional[Dict[str, Any]], Any]:
+        """Execute a chat request and collect its resulting actions."""
+        node = self._get_or_create_chat_runtime(request)
+        node.input = self._create_chat_input(request, node)
+
+        action_history_manager = ActionHistoryManager()
+        actions: List[ActionHistory] = []
+
+        async for action in node.execute_stream_with_interactions(action_history_manager):
+            if action.role == ActionRole.TOOL and action.status == ActionStatus.PROCESSING:
+                continue
+
+            if action.role == ActionRole.INTERACTION and action.status == ActionStatus.PROCESSING:
+                broker = node.interaction_broker
+                if broker:
+                    await auto_submit_interaction(broker, action)
+                continue
+
+            actions.append(action)
+
+        session_info = await node.get_session_info()
+        session_id = session_info.get("session_id")
+        if session_id:
+            self.chat_nodes[session_id] = node
+
+        return actions, session_id, session_info, node
+
+    def _build_chat_response(
+        self,
+        request: RunChatRequest,
+        actions: List[ActionHistory],
+        session_id: Optional[str],
+        session_info: Optional[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> RunChatResponse:
+        """Convert collected chat actions into the public API response."""
+        response_text = ""
+        execution_stats = session_info or {}
+        resolved_error = error
+
+        if not resolved_error:
+            for action in reversed(actions):
+                if action.status != ActionStatus.FAILED:
+                    continue
+                if isinstance(action.output, dict) and action.output.get("error"):
+                    resolved_error = action.output.get("error")
+                else:
+                    resolved_error = action.messages or "Chat execution failed"
+                break
+
+        status_text = "completed" if not resolved_error else "error"
+
+        for action in reversed(actions):
+            if action.status != ActionStatus.SUCCESS or not isinstance(action.output, dict):
+                continue
+
+            if action.output.get("response"):
+                response_text = action.output.get("response", "")
+                execution_stats = action.output.get("execution_stats") or execution_stats
+                break
+
+            if action.output.get("content"):
+                response_text = action.output.get("content", "")
+                execution_stats = action.output.get("execution_stats") or execution_stats
+                break
+
+        serialized_actions = [action.model_dump(mode="json") for action in actions] if request.include_actions else None
+
+        return RunChatResponse(
+            status=status_text,
+            namespace=request.namespace,
+            subagent=request.subagent,
+            session_id=session_id,
+            response=response_text,
+            execution_stats=execution_stats,
+            actions=serialized_actions,
+            error=resolved_error,
+        )
+
+    async def run_chat(self, request: RunChatRequest, client_id: str = None) -> RunChatResponse:
+        """Execute a chat request synchronously and return the final answer."""
+        del client_id  # Auth is enforced at route level; not otherwise used here.
+        try:
+            actions, session_id, session_info, _ = await self._execute_chat_actions(request)
+            return self._build_chat_response(request, actions, session_id, session_info)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error executing chat request: {e}")
+            return self._build_chat_response(
+                request=request,
+                actions=[],
+                session_id=request.session_id,
+                session_info=None,
+                error=str(e),
+            )
+
+    async def run_chat_stream(
+        self, request: RunChatRequest, client_id: str = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Execute a chat request with streaming support and yield actions."""
+        del client_id
+        try:
+            node = self._get_or_create_chat_runtime(request)
+            node.input = self._create_chat_input(request, node)
+
+            action_history_manager = ActionHistoryManager()
+
+            async for action in node.execute_stream_with_interactions(action_history_manager):
+                if action.role == ActionRole.TOOL and action.status == ActionStatus.PROCESSING:
+                    continue
+
+                if action.role == ActionRole.INTERACTION and action.status == ActionStatus.PROCESSING:
+                    broker = node.interaction_broker
+                    if broker:
+                        await auto_submit_interaction(broker, action)
+                    continue
+
+                yield action
+
+            session_info = await node.get_session_info()
+            session_id = session_info.get("session_id")
+            if session_id:
+                self.chat_nodes[session_id] = node
+                request.session_id = session_id
+
+        except Exception as e:
+            logger.error(f"Error executing streaming chat request: {e}")
+            yield ActionHistory(
+                action_id="chat_error",
+                role=ActionRole.ASSISTANT,
+                messages=f"Chat execution failed: {str(e)}",
+                action_type="error",
+                input={"namespace": request.namespace, "subagent": request.subagent},
+                status=ActionStatus.FAILED,
+                output={"error": str(e)},
+            )
 
     def _create_sql_task(self, request: RunWorkflowRequest, task_id: str, agent: Agent) -> SqlTask:
         """Create SQL task from request parameters."""
@@ -313,8 +654,6 @@ service = None
 
 async def generate_sse_stream(req: RunWorkflowRequest, current_client: str):
     """Generate Server-Sent Events stream for workflow execution."""
-    import json
-
     task_id = req.task_id or service._generate_task_id(current_client)
     start_time = time.time()
 
@@ -410,6 +749,42 @@ async def generate_sse_stream(req: RunWorkflowRequest, current_client: str):
 
     except Exception as e:
         logger.error(f"SSE stream error for task {task_id}: {e}")
+        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+
+async def generate_chat_sse_stream(req: RunChatRequest, current_client: str):
+    """Generate Server-Sent Events stream for chat execution."""
+    action_buffer: List[ActionHistory] = []
+
+    try:
+        yield (
+            "event: started\n"
+            f"data: {to_str({'namespace': req.namespace, 'subagent': req.subagent, 'session_id': req.session_id})}\n\n"
+        )
+
+        async for action in service.run_chat_stream(req, current_client):
+            action_buffer.append(action)
+
+            action_payload = {
+                "action_id": action.action_id,
+                "role": action.role,
+                "action_type": action.action_type,
+                "status": action.status,
+                "messages": action.messages,
+                "input": action.input,
+                "output": action.output,
+            }
+            yield f"event: action\ndata: {to_str(action_payload)}\n\n"
+
+        final_response = service._build_chat_response(
+            request=req,
+            actions=action_buffer,
+            session_id=req.session_id,
+            session_info=None,
+        )
+        yield f"event: done\ndata: {to_str(final_response.model_dump(mode='json'))}\n\n"
+    except Exception as e:
+        logger.error(f"Chat SSE stream error: {e}")
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
 
@@ -518,6 +893,50 @@ def create_app(agent_args: argparse.Namespace) -> FastAPI:
             return await service.record_feedback(req)
         except Exception as e:
             logger.error(f"Feedback recording error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/chat/run", response_model=RunChatResponse, tags=["chat"])
+    async def run_chat(req: RunChatRequest, current_client: str = _depends_get_current_client):
+        """Execute a chat request for the default chat node or a configured subagent."""
+        try:
+            logger.info(
+                "Chat request from client=%s namespace=%s subagent=%s session_id=%s",
+                current_client,
+                req.namespace,
+                req.subagent,
+                req.session_id,
+            )
+            return await service.run_chat(req, current_client)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Chat execution error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/chat/run/stream", tags=["chat"])
+    async def run_chat_stream(req: RunChatRequest, current_client: str = _depends_get_current_client):
+        """Execute a chat request and return a Server-Sent Events stream."""
+        try:
+            logger.info(
+                "Streaming chat request from client=%s namespace=%s subagent=%s session_id=%s",
+                current_client,
+                req.namespace,
+                req.subagent,
+                req.session_id,
+            )
+            return StreamingResponse(
+                generate_chat_sse_stream(req, current_client),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Streaming chat execution error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     return app

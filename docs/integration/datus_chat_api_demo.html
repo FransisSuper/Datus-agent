@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Datus Chat API Demo</title>
+  <style>
+    :root {
+      --bg: #f3efe6;
+      --card: #fffaf2;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --accent: #9a3412;
+      --accent-2: #ea580c;
+      --border: #e5d4bf;
+      --user: #dbeafe;
+      --assistant: #ecfccb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(234, 88, 12, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(154, 52, 18, 0.12), transparent 24%),
+        linear-gradient(180deg, #fcfbf7 0%, var(--bg) 100%);
+    }
+    .page {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .hero {
+      margin-bottom: 20px;
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: rgba(255, 250, 242, 0.92);
+      backdrop-filter: blur(10px);
+    }
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 20px;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--card);
+      box-shadow: 0 12px 30px rgba(31, 41, 55, 0.06);
+    }
+    .panel .body {
+      padding: 18px;
+    }
+    .form-group {
+      margin-bottom: 14px;
+    }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    input, textarea {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 14px;
+      background: #fff;
+    }
+    textarea {
+      min-height: 110px;
+      resize: vertical;
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+    }
+    .row > * {
+      flex: 1;
+    }
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+    }
+    .primary {
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+      color: #fff;
+    }
+    .secondary {
+      background: #fff;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .meta {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #fff7ed;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+    .chat {
+      display: flex;
+      flex-direction: column;
+      min-height: 640px;
+    }
+    .chat-log {
+      flex: 1;
+      padding: 18px;
+      overflow: auto;
+    }
+    .msg {
+      margin-bottom: 14px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+      animation: fadeIn 0.25s ease;
+    }
+    .msg.user {
+      background: var(--user);
+    }
+    .msg.assistant {
+      background: var(--assistant);
+    }
+    .msg.system {
+      background: #fef3c7;
+    }
+    .composer {
+      border-top: 1px solid var(--border);
+      padding: 18px;
+    }
+    .status {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      .chat {
+        min-height: 520px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>Datus Chat API Demo</h1>
+      <p>这个页面演示前端如何通过 Datus 暴露的 HTTP API，调用已经接入了元数据 / 数据血缘 MCP 的对话能力。</p>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="body">
+          <div class="form-group">
+            <label for="apiBase">API Base URL</label>
+            <input id="apiBase" value="http://127.0.0.1:8000">
+          </div>
+          <div class="form-group">
+            <label for="clientId">Client ID</label>
+            <input id="clientId" value="datus_client">
+          </div>
+          <div class="form-group">
+            <label for="clientSecret">Client Secret</label>
+            <input id="clientSecret" type="password" value="datus_secret_key">
+          </div>
+          <div class="form-group">
+            <label for="namespace">Namespace</label>
+            <input id="namespace" value="local_duckdb">
+          </div>
+          <div class="form-group">
+            <label for="subagent">Subagent</label>
+            <input id="subagent" value="data_governance">
+          </div>
+          <div class="row">
+            <button class="primary" id="connectBtn">Connect</button>
+            <button class="secondary" id="clearBtn">Clear</button>
+          </div>
+          <div class="meta" id="metaBox">
+            token: not connected
+            <br>
+            session_id: none
+          </div>
+        </div>
+      </section>
+
+      <section class="panel chat">
+        <div class="chat-log" id="chatLog"></div>
+        <div class="composer">
+          <div class="form-group">
+            <label for="message">Message</label>
+            <textarea id="message">请搜索订单相关表，并分析其中一张最相关表的元数据、上下游血缘和影响范围。</textarea>
+          </div>
+          <div class="row">
+            <button class="primary" id="sendBtn">Send</button>
+          </div>
+          <div class="status" id="statusText">Ready</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      token: null,
+      sessionId: null,
+    };
+
+    const apiBaseEl = document.getElementById("apiBase");
+    const clientIdEl = document.getElementById("clientId");
+    const clientSecretEl = document.getElementById("clientSecret");
+    const namespaceEl = document.getElementById("namespace");
+    const subagentEl = document.getElementById("subagent");
+    const messageEl = document.getElementById("message");
+    const chatLogEl = document.getElementById("chatLog");
+    const statusTextEl = document.getElementById("statusText");
+    const metaBoxEl = document.getElementById("metaBox");
+
+    function setStatus(text) {
+      statusTextEl.textContent = text;
+    }
+
+    function renderMeta() {
+      metaBoxEl.innerHTML = [
+        `token: ${state.token ? "connected" : "not connected"}`,
+        `session_id: ${state.sessionId || "none"}`
+      ].join("<br>");
+    }
+
+    function appendMessage(role, text) {
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      div.textContent = text;
+      chatLogEl.appendChild(div);
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    }
+
+    async function connect() {
+      setStatus("Connecting...");
+      const body = new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: clientIdEl.value.trim(),
+        client_secret: clientSecretEl.value.trim(),
+      });
+
+      const resp = await fetch(`${apiBaseEl.value.trim()}/auth/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`auth failed: ${resp.status} ${text}`);
+      }
+
+      const data = await resp.json();
+      state.token = data.access_token;
+      renderMeta();
+      setStatus("Connected");
+      appendMessage("system", "Token 获取成功，前端后续会通过 Datus 后端调用对话能力。");
+    }
+
+    async function sendMessage() {
+      if (!state.token) {
+        await connect();
+      }
+
+      const message = messageEl.value.trim();
+      if (!message) {
+        return;
+      }
+
+      appendMessage("user", message);
+      setStatus("Calling /chat/run ...");
+
+      const payload = {
+        namespace: namespaceEl.value.trim(),
+        subagent: subagentEl.value.trim() || null,
+        session_id: state.sessionId,
+        message,
+        include_actions: false,
+      };
+
+      const resp = await fetch(`${apiBaseEl.value.trim()}/chat/run`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${state.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || data.error || `request failed: ${resp.status}`);
+      }
+
+      state.sessionId = data.session_id || state.sessionId;
+      renderMeta();
+
+      if (data.error) {
+        appendMessage("system", `Error: ${data.error}`);
+        setStatus("Error");
+        return;
+      }
+
+      appendMessage("assistant", data.response || "[empty response]");
+      setStatus("Completed");
+    }
+
+    document.getElementById("connectBtn").addEventListener("click", async () => {
+      try {
+        await connect();
+      } catch (err) {
+        setStatus(`Connect failed: ${err.message}`);
+        appendMessage("system", `Connect failed: ${err.message}`);
+      }
+    });
+
+    document.getElementById("sendBtn").addEventListener("click", async () => {
+      try {
+        await sendMessage();
+      } catch (err) {
+        setStatus(`Send failed: ${err.message}`);
+        appendMessage("system", `Send failed: ${err.message}`);
+      }
+    });
+
+    document.getElementById("clearBtn").addEventListener("click", () => {
+      state.sessionId = null;
+      chatLogEl.innerHTML = "";
+      renderMeta();
+      setStatus("Cleared");
+    });
+
+    renderMeta();
+  </script>
+</body>
+</html>

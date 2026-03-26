@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from datus.api.models import FeedbackResponse, RunWorkflowResponse
+from datus.api.models import FeedbackResponse, RunChatResponse, RunWorkflowResponse
 from datus.api.service import DatusAPIService, create_app
 
 
@@ -271,3 +271,46 @@ class TestAPI:
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
         data = resp.json()
         assert "version" in data, "Root endpoint should contain 'version'"
+
+    @pytest.mark.asyncio
+    async def test_sync_chat(self, authenticated_client):
+        """N8-09: POST /chat/run returns chat response."""
+        with patch.object(DatusAPIService, "run_chat") as mock_run_chat:
+            mock_run_chat.return_value = RunChatResponse(
+                status="completed",
+                namespace="bird_school",
+                subagent="data_governance",
+                session_id="data_governance_session_1",
+                response="治理分析完成",
+                execution_stats={"tool_calls_count": 2},
+                actions=None,
+                error=None,
+            )
+            resp = await authenticated_client.post(
+                "/chat/run",
+                json={
+                    "namespace": "bird_school",
+                    "subagent": "data_governance",
+                    "message": "分析订单表血缘",
+                },
+            )
+
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        data = resp.json()
+        assert data.get("status") == "completed"
+        assert data.get("session_id") == "data_governance_session_1"
+        assert data.get("response") == "治理分析完成"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat(self, authenticated_client):
+        """N8-10: POST /chat/run/stream returns event stream."""
+        resp = await authenticated_client.post(
+            "/chat/run/stream",
+            json={
+                "namespace": "bird_school",
+                "subagent": "data_governance",
+                "message": "分析订单表血缘",
+            },
+        )
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        assert "text/event-stream" in resp.headers.get("content-type", "")

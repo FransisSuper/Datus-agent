@@ -21,6 +21,8 @@ from datus.api.models import (
     FeedbackStatus,
     HealthResponse,
     Mode,
+    RunChatRequest,
+    RunChatResponse,
     RunWorkflowRequest,
     RunWorkflowResponse,
     TokenResponse,
@@ -260,6 +262,64 @@ class TestWorkflowEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Chat endpoint - auth required
+# ---------------------------------------------------------------------------
+
+
+class TestChatEndpoint:
+    def test_chat_requires_auth(self, client):
+        response = client.post(
+            "/chat/run",
+            json={
+                "namespace": "test_ns",
+                "message": "分析订单表血缘",
+            },
+        )
+        assert response.status_code in (401, 403)
+
+    def test_chat_valid_sync_request(self, client, auth_headers):
+        with patch("datus.api.service.DatusAPIService.run_chat") as mock_run_chat:
+            mock_run_chat.return_value = RunChatResponse(
+                status="completed",
+                namespace="test_ns",
+                subagent="data_governance",
+                session_id="data_governance_session_12345678",
+                response="这是治理分析结果",
+                execution_stats={"tool_calls_count": 2},
+                actions=None,
+                error=None,
+            )
+            response = client.post(
+                "/chat/run",
+                json={
+                    "namespace": "test_ns",
+                    "subagent": "data_governance",
+                    "message": "分析订单表血缘",
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+        assert data["session_id"] == "data_governance_session_12345678"
+        assert data["response"] == "这是治理分析结果"
+
+    def test_chat_stream_request(self, client, auth_headers):
+        response = client.post(
+            "/chat/run/stream",
+            json={
+                "namespace": "test_ns",
+                "subagent": "data_governance",
+                "message": "分析订单表血缘",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+
+
+# ---------------------------------------------------------------------------
 # Feedback endpoint - auth required
 # ---------------------------------------------------------------------------
 
@@ -349,3 +409,20 @@ class TestAPIModels:
     def test_feedback_response(self):
         resp = FeedbackResponse(task_id="t1", acknowledged=True, recorded_at="2025-01-01T00:00:00Z")
         assert resp.acknowledged is True
+
+    def test_run_chat_request_defaults(self):
+        req = RunChatRequest(namespace="test", message="hello")
+        assert req.subagent is None
+        assert req.session_id is None
+        assert req.include_actions is False
+
+    def test_run_chat_response(self):
+        resp = RunChatResponse(
+            status="completed",
+            namespace="test",
+            subagent="data_governance",
+            session_id="session_1",
+            response="done",
+        )
+        assert resp.status == "completed"
+        assert resp.session_id == "session_1"

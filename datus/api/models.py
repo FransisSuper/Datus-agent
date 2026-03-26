@@ -57,6 +57,47 @@ class RunWorkflowResponse(BaseModel):
     execution_time: Optional[float] = Field(None, description="Execution time in seconds")
 
 
+class RunChatRequest(BaseModel):
+    """Request model for conversational chat execution."""
+
+    namespace: str = Field(..., description="Target namespace")
+    message: str = Field(..., description="User message")
+    subagent: Optional[str] = Field(
+        default=None,
+        description="Optional subagent name, e.g. data_governance",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Conversation session identifier for multi-turn chat",
+    )
+    catalog_name: Optional[str] = Field(None, description="Catalog name")
+    database_name: Optional[str] = Field(None, description="Database name")
+    schema_name: Optional[str] = Field(None, description="Schema name")
+    include_actions: bool = Field(
+        default=False,
+        description="Whether to include full action history in the response",
+    )
+
+
+class RunChatResponse(BaseModel):
+    """Response model for conversational chat execution."""
+
+    status: str = Field(..., description="Execution status")
+    namespace: str = Field(..., description="Target namespace")
+    subagent: Optional[str] = Field(default=None, description="Resolved subagent name")
+    session_id: Optional[str] = Field(default=None, description="Conversation session identifier")
+    response: str = Field(default="", description="Assistant response")
+    execution_stats: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Execution statistics returned by the node",
+    )
+    actions: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Optional action history for debugging",
+    )
+    error: Optional[str] = Field(default=None, description="Error message if any")
+
+
 class TokenResponse(BaseModel):
     """Token response model."""
 

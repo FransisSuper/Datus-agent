@@ -10,6 +10,8 @@ from .models import (
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
+    RunChatRequest,
+    RunChatResponse,
     RunWorkflowRequest,
     RunWorkflowResponse,
     TokenResponse,
@@ -19,6 +21,8 @@ from .service import create_app, service
 __all__ = [
     "create_app",
     "service",
+    "RunChatRequest",
+    "RunChatResponse",
     "RunWorkflowRequest",
     "RunWorkflowResponse",
     "HealthResponse",

@@ -65,6 +65,8 @@ Once the server is running, you can access:
 - **Interactive Docs**: `http://localhost:8000/docs`
 - **Health Check**: `GET /health`
 - **Authentication**: `POST /auth/token`
+- **Chat Execution**: `POST /chat/run`
+- **Chat Streaming**: `POST /chat/run/stream`
 - **Workflow Execution**: `POST /workflows/run`
 - **Feedback Recording**: `POST /workflows/feedback`
 
@@ -106,6 +108,30 @@ curl -X POST "http://localhost:8000/workflows/run" \
     "namespace": "your_namespace",
     "workflow": "workflow_name",
     "mode": "async"
+  }'
+```
+
+### Run Chat (Synchronous)
+```bash
+curl -X POST "http://localhost:8000/chat/run" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace": "local_duckdb",
+    "subagent": "data_governance",
+    "message": "请分析订单相关表的元数据和上下游血缘"
+  }'
+```
+
+### Run Chat (Streaming)
+```bash
+curl -N -X POST "http://localhost:8000/chat/run/stream" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace": "local_duckdb",
+    "subagent": "data_governance",
+    "message": "请分析订单相关表的元数据和上下游血缘"
   }'
 ```
 
